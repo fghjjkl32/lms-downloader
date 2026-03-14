@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LMS 다운로더</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <header>
+      <h1><span class="logo-icon">&#128218;</span> LMS 다운로더</h1>
+      <button class="theme-toggle" id="themeToggle" title="다크모드 전환">&#9790;</button>
+    </header>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="settings">&#9881; 설정</button>
+      <button class="tab-btn" data-tab="courses">&#128214; 강의 선택</button>
+      <button class="tab-btn" data-tab="download">&#11015; 다운로드</button>
+    </div>
+
+    <!-- ── Settings Tab ──────────────────────────────────── -->
+    <div class="tab-content active" id="tab-settings">
+      <div class="card">
+        <div class="card-title"><span class="icon">&#128273;</span> API 키 설정</div>
+        <div class="form-group">
+          <label class="form-label">OpenAI API Key <span class="hint">(Whisper 음성 인식용)</span></label>
+          <input type="password" class="form-input" id="openaiApiKey" placeholder="sk-...">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Canvas 토큰 <span class="hint">(설정 &gt; 액세스 토큰 - 강의 목록용)</span></label>
+          <input type="password" class="form-input" id="canvasToken" placeholder="64자리 액세스 토큰 입력">
+          <div class="token-status" id="standardTokenStatus"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Learningx 토큰 <span class="hint">(쿠키에서 자동 추출 - 영상 다운로드용)</span></label>
+          <div class="token-status" id="learningxTokenStatus"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span class="icon">&#128193;</span> 경로 설정</div>
+        <div class="form-group">
+          <label class="form-label">쿠키 파일 <span class="hint required-hint">(필수 - 영상/자료 다운로드에 필요)</span></label>
+          <div class="upload-area" id="cookieUploadArea">
+            <input type="file" id="cookieFileInput" accept=".txt,.cookie,.cookies" style="display:none">
+            <button class="btn btn-secondary" id="cookieUploadBtn" type="button">&#128194; 쿠키 파일 업로드</button>
+            <span class="upload-hint">cookies.txt 파일을 선택하거나 여기에 드래그하세요</span>
+          </div>
+          <div class="cookie-help">
+            <p><strong>쿠키 파일 만드는 법:</strong></p>
+            <ol>
+              <li>Chrome 확장 <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" target="_blank">Get cookies.txt LOCALLY</a> 설치</li>
+              <li>canvas.ssu.ac.kr 로그인 상태에서 확장 아이콘 클릭</li>
+              <li>Export 클릭 → 다운받은 파일을 위 버튼으로 업로드</li>
+            </ol>
+          </div>
+          <div class="cookie-status" id="cookieStatus"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">출력 디렉토리</label>
+          <input type="text" class="form-input" id="outputDir" placeholder="~/lms_output">
+        </div>
+        <div class="form-group">
+          <label class="form-label">스크립트 경로</label>
+          <input type="text" class="form-input" id="scriptPath" placeholder="~/lms_download.sh">
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-block" id="saveConfigBtn">&#128190; 설정 저장</button>
+    </div>
+
+    <!-- ── Courses Tab ───────────────────────────────────── -->
+    <div class="tab-content" id="tab-courses">
+      <div class="card">
+        <div class="card-title"><span class="icon">&#128218;</span> 내 강의 목록</div>
+        <div class="select-all-row" style="margin-bottom:12px">
+          <button class="btn btn-secondary btn-sm" id="loadCoursesBtn">&#128260; 강의 불러오기</button>
+          <button class="btn btn-secondary btn-sm" id="selectAllBtn" style="margin-left:8px">전체 선택</button>
+        </div>
+        <div class="course-list" id="courseList">
+          <div class="empty-state">
+            <span class="icon">&#128268;</span>
+            <p>설정에서 Canvas 토큰을 입력한 후 "강의 불러오기"를 눌러주세요</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Download Tab ──────────────────────────────────── -->
+    <div class="tab-content" id="tab-download">
+      <div class="card">
+        <div class="card-title"><span class="icon">&#9881;</span> 다운로드 옵션</div>
+        <div class="option-grid">
+          <label class="option-item">
+            <input type="checkbox" id="optVideo" checked>
+            <div>
+              <div class="option-label">&#127909; 영상 다운로드</div>
+              <div class="option-desc">강의 영상 파일 다운로드</div>
+            </div>
+          </label>
+          <label class="option-item">
+            <input type="checkbox" id="optFile" checked>
+            <div>
+              <div class="option-label">&#128196; 자료 다운로드</div>
+              <div class="option-desc">PDF, 문서 등 강의자료</div>
+            </div>
+          </label>
+          <label class="option-item">
+            <input type="checkbox" id="optTranscribe" checked>
+            <div>
+              <div class="option-label">&#127908; 음성 인식</div>
+              <div class="option-desc">Whisper로 자동 텍스트 변환</div>
+            </div>
+          </label>
+          <label class="option-item">
+            <input type="checkbox" id="optOpenedOnly" checked>
+            <div>
+              <div class="option-label">&#128275; 공개 항목만</div>
+              <div class="option-desc">opened:true 항목만 처리</div>
+            </div>
+          </label>
+        </div>
+
+        <div class="form-group" style="margin-top:16px">
+          <label class="form-label">주차 필터 <span class="hint">(비우면 전체, 예: 1,2,3)</span></label>
+          <input type="text" class="form-input" id="weekFilter" placeholder="예: 1,2,3 또는 9,10,11">
+        </div>
+      </div>
+
+      <div class="card" id="selectedSummary">
+        <div class="card-title"><span class="icon">&#128203;</span> 선택된 강의</div>
+        <div id="selectedCoursesList">
+          <div class="empty-state">
+            <p>강의 선택 탭에서 강의를 먼저 선택해주세요</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="action-bar" id="actionBar">
+        <button class="btn btn-primary" id="startBtn" disabled>&#9654; 다운로드 시작</button>
+        <button class="btn btn-danger" id="stopBtn" style="display:none">&#9724; 중지</button>
+      </div>
+
+      <div class="progress-panel" id="progressPanel">
+        <div class="card">
+          <div class="progress-header">
+            <div class="progress-status">
+              <div class="spinner" id="progressSpinner"></div>
+              <span id="progressLabel">진행 중...</span>
+            </div>
+          </div>
+          <div class="log-container" id="logContainer"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
