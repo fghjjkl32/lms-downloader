@@ -114,9 +114,10 @@ function canvasApiRequest(urlPath, token, cookiesFile) {
 // Settings
 app.get('/api/config', (req, res) => {
   const config = loadConfig();
-  // Mask sensitive fields for display
+  // Mask sensitive fields for display; expose non-secret paths as-is
   res.json({
-    ...config,
+    outputDir: config.outputDir,
+    scriptPath: config.scriptPath,
     openaiApiKey: config.openaiApiKey ? '••••••' + config.openaiApiKey.slice(-4) : '',
     standardToken: config.standardToken ? '••••••' + config.standardToken.slice(-8) : '',
     learningxToken: config.learningxToken ? '••••••' + config.learningxToken.slice(-8) : '',
@@ -125,10 +126,6 @@ app.get('/api/config', (req, res) => {
     hasStandardToken: !!config.standardToken,
     hasLearningxToken: !!config.learningxToken,
   });
-});
-
-app.get('/api/config/raw', (req, res) => {
-  res.json(loadConfig());
 });
 
 app.post('/api/config', (req, res) => {
@@ -267,17 +264,34 @@ app.get('/api/canvas/courses', async (req, res) => {
 let currentProcess = null;
 
 app.get('/api/download/start', (req, res) => {
+  // Prevent concurrent downloads
+  if (currentProcess !== null) {
+    res.status(409).json({ error: '이미 다운로드가 진행 중입니다.' });
+    return;
+  }
+
   const config = loadConfig();
 
   const courseIds = req.query.courseIds;
   const doVideo = req.query.doVideo !== 'false';
   const doFile = req.query.doFile !== 'false';
   const doTranscribe = req.query.doTranscribe !== 'false';
+  const doCompress = req.query.doCompress === 'true';
   const weekFilter = req.query.weekFilter || '';
   const openedOnly = req.query.openedOnly !== 'false';
 
   if (!courseIds) {
     res.status(400).json({ error: '강의를 선택해주세요.' });
+    return;
+  }
+
+  // Input validation
+  if (!/^[0-9,]+$/.test(courseIds)) {
+    res.status(400).json({ error: '올바르지 않은 강의 ID 형식입니다.' });
+    return;
+  }
+  if (weekFilter && !/^[0-9,]*$/.test(weekFilter)) {
+    res.status(400).json({ error: '올바르지 않은 주차 필터 형식입니다.' });
     return;
   }
 
@@ -309,6 +323,7 @@ app.get('/api/download/start', (req, res) => {
   if (!doVideo) args.push('--no-video');
   if (!doFile) args.push('--no-file');
   if (!doTranscribe) args.push('--no-transcribe');
+  if (doCompress) args.push('--compress');
   if (!openedOnly) args.push('--all');
 
   const env = {
@@ -396,7 +411,10 @@ function parseLine(line) {
   if (trimmed.startsWith('[SKIP]')) {
     return { type: 'skip', text: trimmed };
   }
-  if (trimmed.startsWith('[VIDEO] 실패') || trimmed.startsWith('[FILE] 실패') || trimmed.startsWith('[TRANSCRIBE] 실패') || trimmed.startsWith('Error:')) {
+  if (trimmed.startsWith('[VIDEO] 실패') || trimmed.startsWith('[FILE] 실패') || trimmed.startsWith('[TRANSCRIBE] 실패')) {
+    return { type: 'item_error', text: trimmed };
+  }
+  if (trimmed.startsWith('Error:')) {
     return { type: 'error', text: trimmed };
   }
   if (trimmed.startsWith('Warning:')) {
@@ -412,6 +430,6 @@ function parseLine(line) {
 }
 
 // ── Start server ───────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, '127.0.0.1', () => {
   console.log(`LMS Downloader GUI running at http://localhost:${PORT}`);
 });

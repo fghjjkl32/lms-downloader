@@ -59,10 +59,10 @@ function showToast(message, type = 'success') {
 // ── Settings ────────────────────────────────────────────────
 async function loadConfig() {
   try {
-    const res = await fetch('/api/config/raw');
+    const res = await fetch('/api/config');
     const config = await res.json();
-    $('#openaiApiKey').placeholder = config.openaiApiKey ? '(설정됨) 변경하려면 새로 입력' : 'sk-...';
-    $('#canvasToken').placeholder = config.standardToken ? '(설정됨) 변경하려면 새로 입력' : '64자리 액세스 토큰 입력';
+    $('#openaiApiKey').placeholder = config.hasOpenaiKey ? '(설정됨) 변경하려면 새로 입력' : 'sk-...';
+    $('#canvasToken').placeholder = config.hasStandardToken ? '(설정됨) 변경하려면 새로 입력' : '64자리 액세스 토큰 입력';
     $('#outputDir').value = config.outputDir || '';
     $('#scriptPath').value = config.scriptPath || '';
     updateTokenStatus();
@@ -330,6 +330,7 @@ async function startDownload() {
   params.set('doVideo', $('#optVideo').checked);
   params.set('doFile', $('#optFile').checked);
   params.set('doTranscribe', $('#optTranscribe').checked);
+  params.set('doCompress', $('#optCompress').checked);
   params.set('openedOnly', $('#optOpenedOnly').checked);
 
   const weekFilter = $('#weekFilter').value.trim();
@@ -347,7 +348,7 @@ async function startDownload() {
         $('#progressLabel').textContent = msg.data;
       }
 
-      if (msg.type === 'complete' || msg.type === 'error' || msg.type === 'cancelled') {
+      if (msg.type === 'complete' || msg.type === 'cancelled') {
         finishDownload(msg.type);
       }
     } catch {

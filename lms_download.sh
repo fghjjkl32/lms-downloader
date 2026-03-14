@@ -22,6 +22,8 @@ WEEK_FILTER=""
 DO_VIDEO=true
 DO_FILE=true
 DO_TRANSCRIBE=true
+DO_COMPRESS=false
+COMPRESS_MAX_MB=200
 OPENED_ONLY=true
 INTERACTIVE_MODE=false
 TOKEN_FILE="${HOME}/.canvas_token"
@@ -91,6 +93,8 @@ while [[ $# -gt 0 ]]; do
     --no-video) DO_VIDEO=false; shift ;;
     --no-file) DO_FILE=false; shift ;;
     --no-transcribe) DO_TRANSCRIBE=false; shift ;;
+    --compress) DO_COMPRESS=true; shift ;;
+    --compress-mb) DO_COMPRESS=true; COMPRESS_MAX_MB="$2"; shift 2 ;;
     --opened-only) OPENED_ONLY=true; shift ;;
     --all) OPENED_ONLY=false; shift ;;
     -h|--help) usage 0 ;;
@@ -643,6 +647,66 @@ download_video() {
   fi
 }
 
+# ── 영상 압축 (200MB 이하) ──────────────────────────────────
+compress_video() {
+  local video_path="$1"
+  local max_mb="$2"
+
+  if [[ ! -f "$video_path" ]]; then
+    return 0
+  fi
+
+  local size
+  size=$(stat -f%z "$video_path" 2>/dev/null || stat -c%s "$video_path" 2>/dev/null)
+  local max_bytes=$((max_mb * 1024 * 1024))
+
+  if [[ $size -le $max_bytes ]]; then
+    echo "  [COMPRESS] 이미 ${max_mb}MB 이하 ($(( size / 1024 / 1024 ))MB) — 건너뜀"
+    return 0
+  fi
+
+  echo "  [COMPRESS] 압축 시작 ($(( size / 1024 / 1024 ))MB → ${max_mb}MB 이하)"
+
+  local duration
+  duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$video_path" 2>/dev/null)
+  duration=${duration%.*}
+
+  if [[ -z "$duration" || "$duration" -eq 0 ]]; then
+    echo "  [COMPRESS] 실패: 영상 길이를 알 수 없음"
+    return 1
+  fi
+
+  # 목표 비트레이트 계산 (총 비트레이트 = 파일크기 / 시간)
+  # 오디오 128kbps 할당, 나머지 비디오
+  local target_total_bitrate=$(( max_bytes * 8 / duration ))
+  local audio_bitrate=128000
+  local video_bitrate=$(( target_total_bitrate - audio_bitrate ))
+
+  if [[ $video_bitrate -lt 100000 ]]; then
+    echo "  [COMPRESS] 실패: 영상이 너무 길어 ${max_mb}MB로 압축 불가"
+    return 1
+  fi
+
+  local compressed_path="${video_path%.mp4}_compressed.mp4"
+
+  if ffmpeg -i "$video_path" \
+    -c:v libx264 -b:v "${video_bitrate}" -maxrate "$((video_bitrate * 2))" -bufsize "$((video_bitrate * 4))" \
+    -c:a aac -b:a 128k \
+    -preset fast -movflags +faststart \
+    -y "$compressed_path" -loglevel warning 2>&1; then
+
+    local new_size
+    new_size=$(stat -f%z "$compressed_path" 2>/dev/null || stat -c%s "$compressed_path" 2>/dev/null)
+
+    # 원본 교체
+    mv "$compressed_path" "$video_path"
+    echo "  [COMPRESS] 완료: $(( size / 1024 / 1024 ))MB → $(( new_size / 1024 / 1024 ))MB"
+  else
+    echo "  [COMPRESS] 실패: ffmpeg 오류"
+    rm -f "$compressed_path"
+  fi
+}
+
 # ── Whisper transcribe ───────────────────────────────────────
 # ── Whisper API 호출 ─────────────────────────────────────────
 call_whisper() {
@@ -883,6 +947,10 @@ process_course() {
 
           local video_path
           video_path=$(download_video "$local_content_id" "$week_dir" "$title")
+
+          if $DO_COMPRESS && [[ -n "$video_path" ]]; then
+            compress_video "$video_path" "$COMPRESS_MAX_MB"
+          fi
 
           if $DO_TRANSCRIBE && [[ -n "$video_path" ]]; then
             transcribe_video "$video_path" "${week_dir}/${title}.txt" "$title"
