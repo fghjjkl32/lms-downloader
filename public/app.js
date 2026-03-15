@@ -65,6 +65,10 @@ async function loadConfig() {
     $('#canvasToken').placeholder = config.hasStandardToken ? '(설정됨) 변경하려면 새로 입력' : '64자리 액세스 토큰 입력';
     $('#outputDir').value = config.outputDir || '';
     $('#scriptPath').value = config.scriptPath || '';
+    if (config.cpuCores) {
+      $('#cpuThreads').max = config.cpuCores;
+      $('#cpuThreadsMax').textContent = config.cpuCores;
+    }
     updateTokenStatus();
   } catch (e) {
     console.error('Config load failed:', e);
@@ -286,9 +290,14 @@ function updateSelectedSummary() {
 
   startBtn.disabled = false;
   el.innerHTML = state.selectedCourses.map((c) =>
-    `<div style="padding:6px 0;border-bottom:1px solid var(--border-light);font-size:14px;">
-      <strong>${escapeHtml(c.courseName)}</strong>
-      <span style="color:var(--text-muted);font-size:12px;margin-left:8px;">ID: ${c.courseId}</span>
+    `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border-light);font-size:14px;">
+      <div style="flex:1;min-width:0;">
+        <strong>${escapeHtml(c.courseName)}</strong>
+        <span style="color:var(--text-muted);font-size:12px;margin-left:8px;">ID: ${c.courseId}</span>
+      </div>
+      <input type="text" class="form-input week-filter-input" data-course-id="${c.courseId}"
+        placeholder="전체" style="width:100px;padding:4px 8px;font-size:12px;text-align:center;"
+        title="주차 필터 (예: 1,2,3)">
     </div>`
   ).join('');
 }
@@ -322,34 +331,83 @@ async function startDownload() {
   $('#progressPanel').classList.add('active');
   $('#progressSpinner').style.display = 'block';
   $('#progressLabel').textContent = '다운로드 준비 중...';
-  $('#logContainer').innerHTML = '';
-  appendLog('info', '영상 크기에 따라 다운로드에 시간이 걸릴 수 있습니다. 잠시 기다려주세요.');
+  $('#progressCounter').textContent = '';
+
+  // Build per-course progress panels
+  const progressList = $('#courseProgressList');
+  progressList.innerHTML = '';
+  state.courseProgressData = {};
+
+  state.selectedCourses.forEach((c) => {
+    const weekInput = document.querySelector(`.week-filter-input[data-course-id="${c.courseId}"]`);
+    const weekLabel = weekInput && weekInput.value.trim() ? `${weekInput.value.trim()}주차` : '전체';
+
+    state.courseProgressData[c.courseId] = { status: 'waiting', logCount: 0 };
+
+    const card = document.createElement('div');
+    card.className = 'course-progress-card';
+    card.id = `progress-${c.courseId}`;
+    card.innerHTML = `
+      <div class="course-progress-header" onclick="toggleCourseLog('${c.courseId}')">
+        <div class="course-progress-info">
+          <span class="course-progress-name">${escapeHtml(c.courseName)}</span>
+          <span class="course-progress-status" id="status-text-${c.courseId}">${weekLabel} - 대기 중</span>
+        </div>
+        <span class="course-progress-badge waiting" id="badge-${c.courseId}">대기</span>
+      </div>
+      <div class="course-progress-bar"><div class="course-progress-bar-fill" id="bar-${c.courseId}" style="width:0%"></div></div>
+      <div class="course-progress-body" id="body-${c.courseId}">
+        <div class="course-log-container" id="log-${c.courseId}"></div>
+      </div>
+    `;
+    progressList.appendChild(card);
+  });
+
+  // Collect per-course week filters
+  const courseWeeks = {};
+  state.selectedCourses.forEach((c) => {
+    const input = document.querySelector(`.week-filter-input[data-course-id="${c.courseId}"]`);
+    const weeks = input ? input.value.trim() : '';
+    courseWeeks[c.courseId] = weeks;
+  });
 
   const params = new URLSearchParams();
-  params.set('courseIds', state.selectedCourses.map((c) => c.courseId).join(','));
+  params.set('courseWeeks', JSON.stringify(courseWeeks));
   params.set('doVideo', $('#optVideo').checked);
   params.set('doFile', $('#optFile').checked);
   params.set('doTranscribe', $('#optTranscribe').checked);
   params.set('doCompress', $('#optCompress').checked);
+  params.set('compressSize', $('#compressSize').value);
   params.set('openedOnly', $('#optOpenedOnly').checked);
-
-  const weekFilter = $('#weekFilter').value.trim();
-  if (weekFilter) params.set('weekFilter', weekFilter);
+  params.set('cpuThreads', $('#cpuThreads').value);
 
   const eventSource = new EventSource(`/api/download/start?${params.toString()}`);
   state.eventSource = eventSource;
 
+  let completedCount = 0;
+  const totalCourses = state.selectedCourses.length;
+
   eventSource.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
-      appendLog(msg.type, msg.data);
+      const cid = msg.courseId;
 
-      if (msg.type === 'download' || msg.type === 'transcribe' || msg.type === 'status') {
-        $('#progressLabel').textContent = msg.data;
-      }
-
-      if (msg.type === 'complete' || msg.type === 'cancelled') {
+      if (msg.type === 'course_start' && cid) {
+        updateCoursePanel(cid, 'running', msg.data);
+        $('#progressLabel').textContent = `다운로드 중... (${completedCount}/${totalCourses})`;
+      } else if (msg.type === 'course_done' && cid) {
+        completedCount++;
+        const isDoneOk = msg.data.includes('종료 코드: 0');
+        updateCoursePanel(cid, isDoneOk ? 'done' : 'error', msg.data);
+        $('#progressCounter').textContent = `${completedCount}/${totalCourses}`;
+        $('#progressLabel').textContent = `다운로드 중... (${completedCount}/${totalCourses})`;
+      } else if (msg.type === 'complete' || msg.type === 'cancelled') {
         finishDownload(msg.type);
+      } else if (cid) {
+        appendCourseLog(cid, msg.type, msg.data);
+        if (msg.type === 'download' || msg.type === 'transcribe') {
+          updateCourseStatusText(cid, msg.data);
+        }
       }
     } catch {
       // ignore parse errors
@@ -399,13 +457,57 @@ async function stopDownload() {
   appendLog('cancelled', '사용자에 의해 중지되었습니다.');
 }
 
-function appendLog(type, text) {
-  const container = $('#logContainer');
+function appendCourseLog(courseId, type, text) {
+  const container = $(`#log-${courseId}`);
+  if (!container) return;
   const line = document.createElement('div');
   line.className = `log-line type-${type}`;
   line.textContent = text;
   container.appendChild(line);
   container.scrollTop = container.scrollHeight;
+}
+
+function updateCoursePanel(courseId, status, text) {
+  const card = $(`#progress-${courseId}`);
+  const badge = $(`#badge-${courseId}`);
+  const bar = $(`#bar-${courseId}`);
+  if (!card) return;
+
+  card.className = `course-progress-card status-${status}`;
+
+  if (status === 'running') {
+    badge.className = 'course-progress-badge running';
+    badge.innerHTML = '<span class="mini-spinner"></span> 진행 중';
+    bar.style.width = '30%';
+    updateCourseStatusText(courseId, text + ' - 다운로드 중');
+    // Auto-expand running course log
+    const body = $(`#body-${courseId}`);
+    if (body) body.classList.add('expanded');
+  } else if (status === 'done') {
+    badge.className = 'course-progress-badge done';
+    badge.textContent = '완료';
+    bar.style.width = '100%';
+    bar.classList.add('done');
+    updateCourseStatusText(courseId, '완료');
+  } else if (status === 'error') {
+    badge.className = 'course-progress-badge error';
+    badge.textContent = '오류';
+    bar.style.width = '100%';
+    updateCourseStatusText(courseId, text);
+  }
+}
+
+function updateCourseStatusText(courseId, text) {
+  const el = $(`#status-text-${courseId}`);
+  if (el) {
+    // Truncate long status text
+    el.textContent = text.length > 60 ? text.substring(0, 57) + '...' : text;
+  }
+}
+
+function toggleCourseLog(courseId) {
+  const body = $(`#body-${courseId}`);
+  if (body) body.classList.toggle('expanded');
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -418,6 +520,20 @@ function escapeHtml(str) {
 function escapeAttr(str) {
   return str.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+
+// ── Compress options toggle ─────────────────────────────────
+$('#optCompress').addEventListener('change', () => {
+  $('#compressOptions').style.display = $('#optCompress').checked ? 'block' : 'none';
+});
+
+$('#compressSize').addEventListener('input', () => {
+  $('#compressSizeLabel').textContent = `${$('#compressSize').value}MB`;
+});
+
+$('#cpuThreads').addEventListener('input', () => {
+  const val = parseInt($('#cpuThreads').value);
+  $('#cpuThreadsLabel').textContent = val === 0 ? '자동' : `${val} 스레드`;
+});
 
 // ── Init ────────────────────────────────────────────────────
 loadConfig();

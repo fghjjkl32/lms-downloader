@@ -677,26 +677,47 @@ compress_video() {
   fi
 
   # 목표 비트레이트 계산 (총 비트레이트 = 파일크기 / 시간)
-  # 오디오 128kbps 할당, 나머지 비디오
-  local target_total_bitrate=$(( max_bytes * 8 / duration ))
+  # 오디오 128kbps 할당, 나머지 비디오 + 5% 안전 마진
   local audio_bitrate=128000
-  local video_bitrate=$(( target_total_bitrate - audio_bitrate ))
 
-  if [[ $video_bitrate -lt 100000 ]]; then
+  # 15% 안전 마진 적용
+  local safe_bytes=$(( max_bytes * 85 / 100 ))
+  local safe_total_bitrate=$(( safe_bytes * 8 / duration ))
+  local safe_video_bitrate=$(( safe_total_bitrate - audio_bitrate ))
+
+  if [[ $safe_video_bitrate -lt 100000 ]]; then
     echo "  [COMPRESS] 실패: 영상이 너무 길어 ${max_mb}MB로 압축 불가"
     return 1
   fi
 
   local compressed_path="${video_path%.mp4}_compressed.mp4"
+  local passlog="${video_path%.mp4}_passlog"
 
-  if ffmpeg -i "$video_path" \
-    -c:v libx264 -b:v "${video_bitrate}" -maxrate "$((video_bitrate * 2))" -bufsize "$((video_bitrate * 4))" \
+  echo "  [COMPRESS] 압축 중... (목표: ${max_mb}MB)"
+
+  # 15% 안전 마진으로 1-pass 압축 (빠름)
+  if ffmpeg -nostdin -err_detect ignore_err -i "$video_path" \
+    -c:v libx264 -b:v "${safe_video_bitrate}" -maxrate "$((safe_video_bitrate * 13 / 10))" -bufsize "$((safe_video_bitrate * 2))" \
     -c:a aac -b:a 128k \
-    -preset fast -movflags +faststart \
-    -y "$compressed_path" -loglevel warning 2>&1; then
+    -preset fast -threads ${FFMPEG_THREADS:-0} -movflags +faststart \
+    -y "$compressed_path" -loglevel error 2>/dev/null; then
 
     local new_size
     new_size=$(stat -f%z "$compressed_path" 2>/dev/null || stat -c%s "$compressed_path" 2>/dev/null)
+
+    # 초과 시 더 낮은 비트레이트로 재시도 (1회)
+    if [[ $new_size -gt $max_bytes ]]; then
+      echo "  [COMPRESS] 초과 ($(( new_size / 1024 / 1024 ))MB) — 재압축 중..."
+      local retry_bitrate=$(( safe_video_bitrate * max_bytes / new_size * 85 / 100 ))
+
+      ffmpeg -nostdin -err_detect ignore_err -i "$video_path" \
+        -c:v libx264 -b:v "${retry_bitrate}" -maxrate "$((retry_bitrate * 12 / 10))" -bufsize "$((retry_bitrate * 2))" \
+        -c:a aac -b:a 128k \
+        -preset fast -threads ${FFMPEG_THREADS:-0} -movflags +faststart \
+        -y "$compressed_path" -loglevel error 2>/dev/null
+
+      new_size=$(stat -f%z "$compressed_path" 2>/dev/null || stat -c%s "$compressed_path" 2>/dev/null)
+    fi
 
     # 원본 교체
     mv "$compressed_path" "$video_path"
@@ -837,26 +858,36 @@ process_course() {
     [[ -n "$COOKIES_FILE" ]] && module_cookie_args=(-b "$COOKIES_FILE")
 
     local http_status
-    http_status=$(curl -s -o "$json_tmp" -w "%{http_code}" \
-      "${module_cookie_args[@]}" \
-      -H "Authorization: Bearer ${CANVAS_TOKEN:-}" \
-      -H "Referer: https://canvas.ssu.ac.kr/" \
-      "$api_url")
+    local max_retries=3
+    local retry=0
 
-    if [[ "$http_status" == "000" ]]; then
-      echo "Error: 서버 연결 실패"
-      rm -f "$json_tmp"; return 1
-    elif [[ "$http_status" == "401" ]]; then
-      echo "Error: 인증 실패 — CANVAS_TOKEN 확인"
-      rm -f "$json_tmp"; return 1
-    elif [[ "$http_status" == "404" ]]; then
-      echo "Error: 강의를 찾을 수 없음 — course_id($course_id) 확인"
-      rm -f "$json_tmp"; return 1
-    elif [[ "$http_status" != "200" ]]; then
-      echo "Error: API 요청 실패 (HTTP $http_status)"
-      echo "응답: $(head -c 300 "$json_tmp")"
-      rm -f "$json_tmp"; return 1
-    fi
+    while true; do
+      http_status=$(curl -s -o "$json_tmp" -w "%{http_code}" \
+        "${module_cookie_args[@]}" \
+        -H "Authorization: Bearer ${CANVAS_TOKEN:-}" \
+        -H "Referer: https://canvas.ssu.ac.kr/" \
+        "$api_url")
+
+      if [[ "$http_status" == "200" ]]; then
+        break
+      elif [[ "$http_status" == "401" ]]; then
+        echo "Error: 인증 실패 — CANVAS_TOKEN 확인"
+        rm -f "$json_tmp"; return 1
+      elif [[ "$http_status" == "404" ]]; then
+        echo "Error: 강의를 찾을 수 없음 — course_id($course_id) 확인"
+        rm -f "$json_tmp"; return 1
+      else
+        retry=$((retry + 1))
+        if [[ $retry -ge $max_retries ]]; then
+          echo "Error: API 요청 실패 (HTTP $http_status) — ${max_retries}회 재시도 후 포기"
+          echo "응답: $(head -c 300 "$json_tmp")"
+          rm -f "$json_tmp"; return 1
+        fi
+        local wait_sec=$((retry * 3))
+        echo "Warning: API 요청 실패 (HTTP $http_status) — ${wait_sec}초 후 재시도 (${retry}/${max_retries})"
+        sleep "$wait_sec"
+      fi
+    done
   fi
 
   if ! jq empty "$json_tmp" 2>/dev/null; then
@@ -924,7 +955,7 @@ process_course() {
     jq <<< "$module" -c '.module_items[]?' | while read -r item; do
       local content_type opened title inner_type view_url
       content_type=$(jq <<< "$item" -r '.content_type')
-      [[ "$content_type" == "wiki_page" ]] && continue
+      [[ "$content_type" == "wiki_page" || "$content_type" == "quiz" || "$content_type" == "discussion" || "$content_type" == "assignment" ]] && continue
 
       opened=$(jq <<< "$item" -r '.content_data.opened // false')
       $OPENED_ONLY && [[ "$opened" != "true" ]] && continue

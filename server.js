@@ -125,6 +125,7 @@ app.get('/api/config', (req, res) => {
     hasOpenaiKey: !!config.openaiApiKey,
     hasStandardToken: !!config.standardToken,
     hasLearningxToken: !!config.learningxToken,
+    cpuCores: require('os').cpus().length,
   });
 });
 
@@ -272,27 +273,40 @@ app.get('/api/download/start', (req, res) => {
 
   const config = loadConfig();
 
-  const courseIds = req.query.courseIds;
   const doVideo = req.query.doVideo !== 'false';
   const doFile = req.query.doFile !== 'false';
   const doTranscribe = req.query.doTranscribe !== 'false';
   const doCompress = req.query.doCompress === 'true';
-  const weekFilter = req.query.weekFilter || '';
+  const compressSize = parseInt(req.query.compressSize) || 200;
   const openedOnly = req.query.openedOnly !== 'false';
+  const cpuThreads = parseInt(req.query.cpuThreads) || 0;
 
-  if (!courseIds) {
+  // Parse per-course week filters: {"courseId": "weekFilter", ...}
+  let courseWeeks;
+  try {
+    courseWeeks = JSON.parse(req.query.courseWeeks || '{}');
+  } catch {
+    res.status(400).json({ error: '올바르지 않은 요청 형식입니다.' });
+    return;
+  }
+
+  const courseIds = Object.keys(courseWeeks);
+  if (courseIds.length === 0) {
     res.status(400).json({ error: '강의를 선택해주세요.' });
     return;
   }
 
   // Input validation
-  if (!/^[0-9,]+$/.test(courseIds)) {
-    res.status(400).json({ error: '올바르지 않은 강의 ID 형식입니다.' });
-    return;
-  }
-  if (weekFilter && !/^[0-9,]*$/.test(weekFilter)) {
-    res.status(400).json({ error: '올바르지 않은 주차 필터 형식입니다.' });
-    return;
+  for (const id of courseIds) {
+    if (!/^\d+$/.test(id)) {
+      res.status(400).json({ error: '올바르지 않은 강의 ID 형식입니다.' });
+      return;
+    }
+    const wf = courseWeeks[id];
+    if (wf && !/^[0-9,]+$/.test(wf)) {
+      res.status(400).json({ error: `올바르지 않은 주차 필터 형식입니다: ${wf}` });
+      return;
+    }
   }
 
   // SSE headers
@@ -302,91 +316,126 @@ app.get('/api/download/start', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const sendEvent = (type, data) => {
-    res.write(`data: ${JSON.stringify({ type, data })}\n\n`);
+  const sendEvent = (type, data, courseId) => {
+    res.write(`data: ${JSON.stringify({ type, data, courseId: courseId || null })}\n\n`);
   };
 
-  // Build shell command args
   const scriptPath = config.scriptPath || DEFAULT_SCRIPT_PATH;
-  const args = [];
-
-  // Add course IDs
-  args.push('-c', courseIds);
-
-  // Output dir
-  if (config.outputDir) args.push('-o', config.outputDir);
-
-  // Week filter
-  if (weekFilter) args.push('-w', weekFilter);
-
-  // Flags
-  if (!doVideo) args.push('--no-video');
-  if (!doFile) args.push('--no-file');
-  if (!doTranscribe) args.push('--no-transcribe');
-  if (doCompress) args.push('--compress');
-  if (!openedOnly) args.push('--all');
-
   const env = {
     ...process.env,
     CANVAS_TOKEN: config.learningxToken || '',
     OPENAI_API_KEY: config.openaiApiKey || '',
     COOKIES_FILE: config.cookiesFile || '',
+    FFMPEG_THREADS: String(cpuThreads),
   };
 
-  sendEvent('status', '다운로드를 시작합니다...');
-  sendEvent('command', `${scriptPath} ${args.join(' ')}`);
+  // Group courses by week filter to minimize script runs
+  const groups = {};
+  for (const [id, wf] of Object.entries(courseWeeks)) {
+    const key = wf || '';
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(id);
+  }
 
-  const child = spawn('bash', [scriptPath, ...args], {
-    env,
-    cwd: process.env.HOME,
-  });
+  // Each courseId gets its own script run (parallel)
+  const jobs = [];
+  for (const [id, wf] of Object.entries(courseWeeks)) {
+    jobs.push({ courseId: id, weekFilter: wf || '' });
+  }
 
-  currentProcess = child;
+  let cancelled = false;
+  const children = [];
+  let completed = 0;
 
-  child.stdout.on('data', (data) => {
-    const lines = data.toString().split('\n').filter(Boolean);
-    for (const line of lines) {
-      const parsed = parseLine(line);
-      sendEvent(parsed.type, parsed.text);
-    }
-  });
+  sendEvent('status', `다운로드를 시작합니다... (${jobs.length}개 강의, 병렬 실행)`);
 
-  child.stderr.on('data', (data) => {
-    const lines = data.toString().split('\n').filter(Boolean);
-    for (const line of lines) {
-      // stderr에도 정상 진행 메시지가 포함됨 (curl progress, video status 등)
-      const parsed = parseLine(line);
-      sendEvent(parsed.type, parsed.text);
-    }
-  });
+  for (const job of jobs) {
+    const args = ['-c', job.courseId];
+    if (config.outputDir) args.push('-o', config.outputDir);
+    if (job.weekFilter) args.push('-w', job.weekFilter);
+    if (!doVideo) args.push('--no-video');
+    if (!doFile) args.push('--no-file');
+    if (!doTranscribe) args.push('--no-transcribe');
+    if (doCompress) args.push('--compress-mb', String(compressSize));
+    if (!openedOnly) args.push('--all');
 
-  child.on('close', (code) => {
-    currentProcess = null;
-    // code !== 0이어도 다운로드가 부분 성공했을 수 있음
-    if (code === null) {
-      sendEvent('cancelled', '다운로드가 취소되었습니다.');
-    } else {
-      sendEvent('complete', `다운로드가 완료되었습니다. (종료 코드: ${code})`);
-    }
-    res.end();
-  });
+    const weekLabel = job.weekFilter ? `${job.weekFilter}주차` : '전체';
+    sendEvent('course_start', weekLabel, job.courseId);
 
-  child.on('error', (err) => {
-    currentProcess = null;
-    sendEvent('error', `실행 오류: ${err.message}`);
-    res.end();
-  });
+    const child = spawn('bash', [scriptPath, ...args], { env, cwd: process.env.HOME });
+    children.push(child);
+
+    child.stdout.on('data', (data) => {
+      if (cancelled) return;
+      const lines = data.toString().split('\n').filter(Boolean);
+      for (const line of lines) {
+        const parsed = parseLine(line);
+        sendEvent(parsed.type, parsed.text, job.courseId);
+      }
+    });
+
+    child.stderr.on('data', (data) => {
+      if (cancelled) return;
+      const lines = data.toString().split('\n').filter(Boolean);
+      for (const line of lines) {
+        const parsed = parseLine(line);
+        sendEvent(parsed.type, parsed.text, job.courseId);
+      }
+    });
+
+    child.on('close', (code) => {
+      completed++;
+      if (code === null && !cancelled) {
+        sendEvent('course_done', '취소됨', job.courseId);
+      } else {
+        sendEvent('course_done', `완료 (종료 코드: ${code})`, job.courseId);
+      }
+
+      if (completed >= jobs.length) {
+        currentProcess = null;
+        if (cancelled) {
+          sendEvent('cancelled', '다운로드가 취소되었습니다.');
+        } else {
+          sendEvent('complete', '모든 다운로드가 완료되었습니다.');
+        }
+        res.end();
+      }
+    });
+
+    child.on('error', (err) => {
+      completed++;
+      sendEvent('error', `강의 ${job.courseId} 실행 오류: ${err.message}`);
+      if (completed >= jobs.length) {
+        currentProcess = null;
+        res.end();
+      }
+    });
+  }
+
+  activeChildren = children;
+  currentProcess = children[0] || null;
 
   req.on('close', () => {
-    if (currentProcess === child) {
-      child.kill('SIGTERM');
-      currentProcess = null;
+    cancelled = true;
+    for (const child of children) {
+      try { child.kill('SIGTERM'); } catch {}
     }
+    activeChildren = [];
+    currentProcess = null;
   });
 });
 
+let activeChildren = [];
+
 app.post('/api/download/stop', (req, res) => {
-  if (currentProcess) {
+  if (activeChildren.length > 0) {
+    for (const child of activeChildren) {
+      try { child.kill('SIGTERM'); } catch {}
+    }
+    activeChildren = [];
+    currentProcess = null;
+    res.json({ success: true, message: '다운로드가 취소되었습니다.' });
+  } else if (currentProcess) {
     currentProcess.kill('SIGTERM');
     currentProcess = null;
     res.json({ success: true, message: '다운로드가 취소되었습니다.' });
