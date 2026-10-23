@@ -1,16 +1,44 @@
 {
   "name": "lms-downloader",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "electron/main.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "app": "electron .",
+    "dist": "electron-builder --mac dir",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dist:dmg": "electron-builder --mac dmg --arm64"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "숭실대 Canvas LMS 강의 다운로더",
   "dependencies": {
     "express": "^5.2.1"
+  },
+  "productName": "LMS Downloader",
+  "build": {
+    "appId": "com.lms-downloader.app",
+    "productName": "LMS Downloader",
+    "asar": false,
+    "files": [
+      "server.js",
+      "lms_download.sh",
+      "public/**",
+      "electron/**",
+      "package.json"
+    ],
+    "mac": {
+      "target": "dir",
+      "category": "public.app-category.education"
+    },
+    "dmg": {
+      "title": "LMS Downloader"
+    },
+    "artifactName": "${productName}-${version}-${arch}.${ext}"
+  },
+  "devDependencies": {
+    "electron": "^44.8.0",
+    "electron-builder": "^26.15.3"
   }
 }
