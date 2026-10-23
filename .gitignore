@@ -4,3 +4,4 @@ cookies.txt
 output/
 .DS_Store
 .omc/
+dist/

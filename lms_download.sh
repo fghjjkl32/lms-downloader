@@ -13,6 +13,11 @@
 
 set -uo pipefail
 
+# while 파이프 안(하위 셸)에서 난 실패도 종료 코드에 반영하기 위해 파일에 기록한다
+FAIL_LOG=$(mktemp)
+trap 'rm -f "$FAIL_LOG"' EXIT
+mark_failed() { echo "$1" >> "$FAIL_LOG"; }
+
 # ── 기본값 ──────────────────────────────────────────────────
 CANVAS_BASE="https://canvas.ssu.ac.kr/learningx"
 COURSE_IDS=()
@@ -21,6 +26,15 @@ JSON_FILE=""
 WEEK_FILTER=""
 DO_VIDEO=true
 DO_FILE=true
+DO_ATTACH=true
+SAVE_SRT=false
+# 음성 인식 방식: local(내 Mac에서 무료, mlx-whisper) | openai(API 키, 유료) | server(OpenAI 호환 서버)
+TRANSCRIBE_ENGINE="${TRANSCRIBE_ENGINE:-local}"
+OPENAI_WHISPER_URL="https://api.openai.com/v1/audio/transcriptions"
+WHISPER_URL="${WHISPER_URL:-}"
+WHISPER_MODEL="${WHISPER_MODEL:-whisper-1}"
+WHISPER_VENV="${WHISPER_VENV:-$HOME/.cache/lms-downloader/whisper-venv}"
+LOCAL_WHISPER_MODEL="${LOCAL_WHISPER_MODEL:-mlx-community/whisper-large-v3-turbo}"
 DO_TRANSCRIBE=true
 DO_COMPRESS=false
 COMPRESS_MAX_MB=200
@@ -41,13 +55,18 @@ Usage: $(basename "$0") [옵션]
   -w <n>           특정 주차만 처리 (예: -w 1 또는 -w 1,2,3)
   --no-video       영상 다운로드/transcribe 건너뜀
   --no-file        자료 파일 다운로드 건너뜀
+  --no-attach      공지·과제 첨부파일 다운로드 건너뜀
+  --srt            음성 인식 결과를 .srt 자막으로도 저장
   --no-transcribe  transcribe 건너뜀 (영상만 다운로드)
   --opened-only    opened:true 항목만 처리 (기본값)
   --all            미공개 포함 전체 시도
   -h, --help       이 도움말 출력
 
 환경변수:
-  OPENAI_API_KEY   Whisper API 키 (transcribe 시 필요)
+  TRANSCRIBE_ENGINE  음성 인식 방식: local(기본, 무료) | openai | server
+  OPENAI_API_KEY     Whisper API 키 (openai 방식에서 필요)
+  WHISPER_URL        OpenAI 호환 음성 인식 주소 (server 방식에서 필요)
+  WHISPER_MODEL      openai·server 방식의 모델 이름 (기본: whisper-1)
   CANVAS_TOKEN     Canvas API 토큰 (설정 > 액세스 토큰)
   COOKIES_FILE     commons.ssu.ac.kr 쿠키 파일 (Netscape 형식)
 
@@ -92,6 +111,8 @@ while [[ $# -gt 0 ]]; do
     -w) WEEK_FILTER="$2"; shift 2 ;;
     --no-video) DO_VIDEO=false; shift ;;
     --no-file) DO_FILE=false; shift ;;
+    --no-attach) DO_ATTACH=false; shift ;;
+    --srt) SAVE_SRT=true; shift ;;
     --no-transcribe) DO_TRANSCRIBE=false; shift ;;
     --compress) DO_COMPRESS=true; shift ;;
     --compress-mb) DO_COMPRESS=true; COMPRESS_MAX_MB="$2"; shift 2 ;;
@@ -128,9 +149,24 @@ if [[ -n "$JSON_FILE" && ! -f "$JSON_FILE" ]]; then
   exit 1
 fi
 
-if $DO_TRANSCRIBE && [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "Error: OPENAI_API_KEY not set (transcribe 끄려면 --no-transcribe)"
-  exit 1
+if $DO_TRANSCRIBE; then
+  case "$TRANSCRIBE_ENGINE" in
+    local) ;;
+    openai)
+      if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+        echo "Error: OPENAI_API_KEY not set (무료 방식은 TRANSCRIBE_ENGINE=local, 끄려면 --no-transcribe)"
+        exit 1
+      fi
+      WHISPER_URL="$OPENAI_WHISPER_URL" ;;
+    server)
+      if [[ -z "$WHISPER_URL" ]]; then
+        echo "Error: WHISPER_URL not set (server 방식은 음성 인식 서버 주소가 필요합니다)"
+        exit 1
+      fi ;;
+    *)
+      echo "Error: 알 수 없는 TRANSCRIBE_ENGINE: $TRANSCRIBE_ENGINE (local, openai, server 중 하나)"
+      exit 1 ;;
+  esac
 fi
 
 COOKIES_FILE="${COOKIES_FILE:-}"
@@ -168,7 +204,7 @@ api_request() {
   local cookie_args=()
   [[ -n "$COOKIES_FILE" ]] && cookie_args=(-b "$COOKIES_FILE")
 
-  curl -sf "${cookie_args[@]}" \
+  curl -sf ${cookie_args[@]+"${cookie_args[@]}"} \
     -H "Authorization: Bearer ${CANVAS_TOKEN:-}" \
     -H "Referer: https://canvas.ssu.ac.kr/" \
     "$url"
@@ -529,11 +565,129 @@ convert_to_markdown() {
 }
 
 # ── 파일 다운로드 (자료) ─────────────────────────────────────
+# ── 외부 링크 저장 (embed) ───────────────────────────────────
+# 링크 항목의 뷰어 페이지는 버튼을 누르면 window.open("<원래 주소>")를 호출한다
+save_link() {
+  local content_id="$1"
+  local dest="$2"
+  local name="$3"
+
+  if [[ -f "$dest" ]]; then
+    echo "  [SKIP] 이미 존재: ${name}.webloc"
+    return 0
+  fi
+
+  local cookie_args=()
+  [[ -n "$COOKIES_FILE" ]] && cookie_args=(-b "$COOKIES_FILE")
+
+  local link_url
+  link_url=$(curl -sf ${cookie_args[@]+"${cookie_args[@]}"} "https://commons.ssu.ac.kr/em/${content_id}" \
+    | grep -oE 'window\.open\("https?://[^"]+' | grep -v 'commons\.ssu\.ac\.kr' | head -1 | sed 's/^window\.open("//')
+
+  if [[ -z "$link_url" ]]; then
+    echo "  [LINK] 실패: 링크 주소를 찾지 못함 ($name)"
+    mark_failed "link: $name"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$dest")"
+  # .webloc은 Finder에서 더블클릭하면 브라우저로 열리는 macOS 링크 파일이다
+  local escaped="${link_url//&/&amp;}"
+  cat > "$dest" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>URL</key>
+  <string>${escaped}</string>
+</dict>
+</plist>
+EOF
+  echo "  [LINK] 완료: $link_url"
+}
+
+# ── 공지·과제 첨부파일 ───────────────────────────────────────
+# Canvas 표준 API는 JSON 앞에 while(1);을 붙여 응답하므로 떼어 낸다
+canvas_api_get() {
+  local cookie_args=()
+  [[ -n "$COOKIES_FILE" ]] && cookie_args=(-b "$COOKIES_FILE")
+  curl -sf ${cookie_args[@]+"${cookie_args[@]}"} -H "Referer: https://canvas.ssu.ac.kr/" "https://canvas.ssu.ac.kr/api/v1/$1" | sed 's/^while(1);//'
+}
+
+download_attachments() {
+  local course_id="$1"
+  local course_dir="$2"
+
+  echo ""
+  echo "────────────────────────────────────────"
+  echo " 공지·과제 첨부파일"
+  echo "────────────────────────────────────────"
+
+  local kind list refs title_field body_field
+  for kind in 공지 과제; do
+    if [[ "$kind" == "공지" ]]; then
+      list=$(canvas_api_get "courses/${course_id}/discussion_topics?only_announcements=true&per_page=100")
+      title_field="title"; body_field="message"
+    else
+      list=$(canvas_api_get "courses/${course_id}/assignments?per_page=100")
+      title_field="name"; body_field="description"
+    fi
+
+    if ! jq -e 'type == "array"' <<< "$list" >/dev/null 2>&1; then
+      echo "Warning: ${kind} 목록을 가져오지 못했습니다"
+      continue
+    fi
+
+    # 각 줄: 제목<TAB>파일 API 경로. 첨부 목록과 본문에 넣은 파일 링크를 모두 모은다
+    refs=$(jq -r --arg cid "$course_id" --arg tf "$title_field" --arg bf "$body_field" '
+      .[] | .[$tf] as $t
+      | ([(.attachments // [])[] | "courses/\($cid)/files/\(.id)"]
+         + [(.[$bf] // "") | scan("courses/[0-9]+/files/[0-9]+")])
+      | unique[] | "\($t)\t\(.)"' <<< "$list")
+
+    [[ -z "$refs" ]] && continue
+
+    local item_title ref meta fname url
+    while IFS=$'\t' read -r item_title ref; do
+      [[ -z "$ref" ]] && continue
+      meta=$(canvas_api_get "$ref")
+      fname=$(jq -r '.display_name // empty' <<< "$meta" 2>/dev/null | tr '/' '-')
+      url=$(jq -r '.url // empty' <<< "$meta" 2>/dev/null)
+      # 다른 강의의 파일이나 잠긴 파일은 권한이 없어 받을 수 없다
+      if [[ -z "$fname" || -z "$url" ]]; then
+        echo "  [SKIP] 첨부 접근 불가: $item_title"
+        continue
+      fi
+      download_file "$url" "${course_dir}/${kind}/$(tr '/' '-' <<< "$item_title")/${fname}" "$fname" "https://canvas.ssu.ac.kr/"
+    done <<< "$refs"
+  done
+}
+
+# Content-Disposition 헤더의 파일 이름 (없으면 빈 문자열)
+remote_filename() {
+  local cookie_args=()
+  [[ -n "$COOKIES_FILE" ]] && cookie_args=(-b "$COOKIES_FILE")
+  curl -sIL ${cookie_args[@]+"${cookie_args[@]}"} -H "Referer: $2" "$1" \
+    | grep -i '^content-disposition:' | tail -1 | sed -E 's/.*filename="?([^";]*)"?.*/\1/' | tr -d '\r'
+}
+
+# 자료 파일 자리에 HTML 페이지가 저장됐는지 확인한다 (뷰어 페이지나 로그인 페이지)
+is_html_page() {
+  [[ "$1" != *.htm && "$1" != *.html ]] && head -c 512 "$1" 2>/dev/null | grep -qiE '<!doctype html|<html'
+}
+
 download_file() {
   local url="$1"
   local dest="$2"
   local name="$3"
+  local referer="$4"
   local downloaded=false
+
+  # 예전 버전은 뷰어 HTML을 자료 파일 이름으로 저장했으므로 그런 파일은 지우고 다시 받는다
+  if [[ -f "$dest" ]] && is_html_page "$dest"; then
+    echo "  [FILE] 잘못 저장된 파일 다시 받기: $name"
+    rm -f "$dest" "${dest%.*}.md"
+  fi
 
   if [[ -f "$dest" ]]; then
     echo "  [SKIP] 이미 존재: $name"
@@ -548,12 +702,14 @@ download_file() {
     [[ -n "$COOKIES_FILE" ]] && cookie_args=(-b "$COOKIES_FILE")
 
     echo "  [FILE] 다운로드: $name"
-    if curl -sf -L "${cookie_args[@]}" -o "$dest" "$url"; then
+    if curl -sf -L ${cookie_args[@]+"${cookie_args[@]}"} -H "Referer: ${referer}" -o "${dest}.part" "$url" \
+      && ! is_html_page "${dest}.part" && mv "${dest}.part" "$dest"; then
       echo "  [FILE] 완료: $dest"
       downloaded=true
     else
       echo "  [FILE] 실패: $url"
-      rm -f "$dest"
+      rm -f "${dest}.part"
+      mark_failed "file: $name"
     fi
   fi
 
@@ -589,11 +745,12 @@ download_video() {
   [[ -n "$COOKIES_FILE" ]] && cookie_args=(-b "$COOKIES_FILE")
 
   local content_xml
-  content_xml=$(curl -sf "${cookie_args[@]}" \
+  content_xml=$(curl -sf ${cookie_args[@]+"${cookie_args[@]}"} \
     "https://commons.ssu.ac.kr/viewer/ssplayer/uniplayer_support/content.php?content_id=${content_id}")
 
   if [[ -z "$content_xml" ]]; then
     echo "  [VIDEO] 실패: content.php 응답 없음 (쿠키 확인)" >&2
+    mark_failed "video: $title"
     return 1
   fi
 
@@ -628,22 +785,24 @@ download_video() {
   if [[ -z "$mp4_url" ]]; then
     echo "  [VIDEO] 실패: XML에서 media URL 추출 실패" >&2
     echo "  XML: $(echo "$content_xml" | head -c 500)" >&2
+    mark_failed "video: $title"
     return 1
   fi
 
   echo "  [VIDEO] 다운로드: $title" >&2
   echo "  URL: $mp4_url" >&2
 
-  if curl -Lf "${cookie_args[@]}" \
+  if curl -Lf ${cookie_args[@]+"${cookie_args[@]}"} \
     -H "Referer: https://commons.ssu.ac.kr/" \
     --progress-bar \
-    -o "$out_path" \
-    "$mp4_url"; then
+    -o "${out_path}.part" \
+    "$mp4_url" && mv "${out_path}.part" "$out_path"; then
     echo "  [VIDEO] 완료: $out_path" >&2
     echo "$out_path"
   else
     echo "  [VIDEO] 실패: $mp4_url" >&2
-    rm -f "$out_path"
+    rm -f "${out_path}.part"
+    mark_failed "video: $title"
   fi
 }
 
@@ -673,6 +832,7 @@ compress_video() {
 
   if [[ -z "$duration" || "$duration" -eq 0 ]]; then
     echo "  [COMPRESS] 실패: 영상 길이를 알 수 없음"
+    mark_failed "compress: $video_path"
     return 1
   fi
 
@@ -687,6 +847,7 @@ compress_video() {
 
   if [[ $safe_video_bitrate -lt 100000 ]]; then
     echo "  [COMPRESS] 실패: 영상이 너무 길어 ${max_mb}MB로 압축 불가"
+    mark_failed "compress: $video_path"
     return 1
   fi
 
@@ -725,6 +886,7 @@ compress_video() {
   else
     echo "  [COMPRESS] 실패: ffmpeg 오류"
     rm -f "$compressed_path"
+    mark_failed "compress: $video_path"
   fi
 }
 
@@ -733,17 +895,23 @@ compress_video() {
 call_whisper() {
   local audio_file="$1"
   local response_tmp="/tmp/whisper_response_$$.txt"
+  local format="text"
+  $SAVE_SRT && format="srt"
+
+  # OpenAI 키는 OpenAI 방식에서만 보낸다 (다른 서버 주소로 키가 새지 않게)
+  local auth_args=()
+  [[ "$TRANSCRIBE_ENGINE" == "openai" ]] && auth_args=(-H "Authorization: Bearer $OPENAI_API_KEY")
 
   local http_status
   http_status=$(curl -s \
     -o "$response_tmp" \
     -w "%{http_code}" \
-    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    ${auth_args[@]+"${auth_args[@]}"} \
     -F file="@$audio_file" \
-    -F model="whisper-1" \
-    -F response_format="text" \
+    -F model="$WHISPER_MODEL" \
+    -F response_format="$format" \
     -F language="ko" \
-    https://api.openai.com/v1/audio/transcriptions)
+    "$WHISPER_URL")
 
   if [[ "$http_status" == "200" ]]; then
     cat "$response_tmp"
@@ -756,12 +924,111 @@ call_whisper() {
   fi
 }
 
+# ── 무료 음성 인식 (mlx-whisper, Apple Silicon) ──────────────
+# 디렉터리 생성은 원자적이므로 잠금으로 쓴다. 잠근 프로세스가 죽었으면 잠금을 치운다
+acquire_lock() {
+  local lock="$1"
+  until mkdir "$lock" 2>/dev/null; do
+    local owner
+    owner=$(cat "$lock/pid" 2>/dev/null)
+    if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$lock"
+      continue
+    fi
+    sleep 2
+  done
+  echo $$ > "$lock/pid"
+}
+
+release_lock() { rm -rf "$1"; }
+
+ensure_local_whisper() {
+  [[ -x "$WHISPER_VENV/bin/mlx_whisper" ]] && return 0
+
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    echo "  [TRANSCRIBE] 실패: 무료 음성 인식은 Apple Silicon Mac에서만 동작합니다 (OpenAI 방식을 쓰세요)"
+    return 1
+  fi
+
+  # 여러 강의를 병렬로 받을 때 한 번만 설치하도록 잠근다
+  mkdir -p "$(dirname "$WHISPER_VENV")"
+  acquire_lock "${WHISPER_VENV}.install.lock"
+  if [[ ! -x "$WHISPER_VENV/bin/mlx_whisper" ]]; then
+    echo "  [TRANSCRIBE] 무료 음성 인식 엔진 설치 중 (처음 한 번만, 1~2분)"
+    rm -rf "$WHISPER_VENV"
+    local installed=false
+    if command -v uv >/dev/null 2>&1; then
+      uv venv -q -p 3.13 "$WHISPER_VENV" && uv pip install -q -p "$WHISPER_VENV/bin/python" mlx-whisper && installed=true
+    else
+      local py
+      for py in python3.13 python3.12 python3.11 python3.10; do
+        command -v "$py" >/dev/null 2>&1 || continue
+        "$py" -m venv "$WHISPER_VENV" && "$WHISPER_VENV/bin/pip" install -q mlx-whisper && installed=true
+        break
+      done
+    fi
+    if ! $installed; then
+      rm -rf "$WHISPER_VENV"
+      echo "  [TRANSCRIBE] 실패: 엔진 설치 실패 (Python 3.10 이상 또는 uv가 필요합니다)"
+    fi
+  fi
+  release_lock "${WHISPER_VENV}.install.lock"
+  [[ -x "$WHISPER_VENV/bin/mlx_whisper" ]]
+}
+
+# 결과를 out_dir/<오디오 이름>.txt, .srt로 남긴다
+transcribe_local() {
+  local audio_file="$1"
+  local out_dir="$2"
+  ensure_local_whisper || return 1
+
+  # 모델 하나가 메모리를 수 GB 쓰므로, 여러 강의를 병렬로 받아도 음성 인식은 하나씩 처리한다
+  local lock="${WHISPER_VENV}.run.lock"
+  [[ -d "$lock" ]] && echo "  [TRANSCRIBE] 다른 강의의 음성 인식이 끝나기를 기다리는 중..."
+  acquire_lock "$lock"
+  echo "  [TRANSCRIBE] 내 Mac에서 처리 중 (무료, 처음에는 모델 1.6GB를 내려받습니다)"
+  "$WHISPER_VENV/bin/mlx_whisper" "$audio_file" \
+    --model "$LOCAL_WHISPER_MODEL" --language ko \
+    --output-format all --output-dir "$out_dir" --verbose False \
+    < /dev/null > /dev/null 2>&1
+  local rc=$?
+  release_lock "$lock"
+  return $rc
+}
+
+# SRT 시각에 offset초를 더하고 번호를 start부터 다시 매긴다 (분할한 청크를 이어 붙이기 위해)
+shift_srt() {
+  tr -d '\r' | awk -v off="$1" -v idx="$2" '
+    function sec(ts,  a) { split(ts, a, /[:,]/); return a[1] * 3600 + a[2] * 60 + a[3] + a[4] / 1000 }
+    function fmt(t,  ms, h, m, s) {
+      ms = int(t * 1000 + 0.5)
+      h = int(ms / 3600000); ms -= h * 3600000
+      m = int(ms / 60000); ms -= m * 60000
+      s = int(ms / 1000); ms -= s * 1000
+      return sprintf("%02d:%02d:%02d,%03d", h, m, s, ms)
+    }
+    BEGIN { RS = ""; FS = "\n" }
+    $2 ~ / --> / {
+      split($2, t, / --> /)
+      print idx++
+      print fmt(sec(t[1]) + off) " --> " fmt(sec(t[2]) + off)
+      for (i = 3; i <= NF; i++) print $i
+      print ""
+    }'
+}
+
+# SRT에서 번호와 시각을 빼고 자막 문장만 남긴다
+srt_to_text() {
+  awk 'BEGIN { RS = ""; FS = "\n" } { line = ""; for (i = 3; i <= NF; i++) line = line (i > 3 ? " " : "") $i; print line }'
+}
+
 transcribe_video() {
   local video_path="$1"
   local out_txt="$2"
   local title="$3"
+  local out_srt="${out_txt%.txt}.srt"
 
-  if [[ -f "$out_txt" ]]; then
+  if [[ -f "$out_txt" ]] && { ! $SAVE_SRT || [[ -f "$out_srt" ]]; }; then
     echo "  [SKIP] 이미 transcribe됨: $title"
     return 0
   fi
@@ -778,11 +1045,12 @@ transcribe_video() {
 
   # 전체 오디오 추출
   local audio_full="${tmp_dir}/full.mp3"
-  ffmpeg -i "$video_path" -vn -ar 16000 -ac 1 -b:a 32k "$audio_full" -y -loglevel error
+  ffmpeg -nostdin -i "$video_path" -vn -ar 16000 -ac 1 -b:a 32k "$audio_full" -y -loglevel error
 
   if [[ ! -f "$audio_full" ]]; then
     echo "  [TRANSCRIBE] 실패: 오디오 추출 실패"
     rm -rf "$tmp_dir"
+    mark_failed "transcribe: $title"
     return 1
   fi
 
@@ -791,11 +1059,25 @@ transcribe_video() {
   local max_size=24000000  # 24MB
 
   local final_text=""
+  local chunk_failed=false
 
-  if [[ $size -le $max_size ]]; then
+  if [[ "$TRANSCRIBE_ENGINE" == "local" ]]; then
+    # 로컬 엔진은 파일 크기 제한이 없으므로 나누지 않는다
+    local base="${tmp_dir}/$(basename "${audio_full%.*}")"
+    if transcribe_local "$audio_full" "$tmp_dir"; then
+      if $SAVE_SRT; then
+        final_text=$(cat "${base}.srt" 2>/dev/null)
+      else
+        final_text=$(cat "${base}.txt" 2>/dev/null)
+      fi
+    else
+      chunk_failed=true
+    fi
+  elif [[ $size -le $max_size ]]; then
     # 24MB 이하: 그대로 처리
     echo "  [TRANSCRIBE] 단일 처리 ($(( size / 1024 / 1024 ))MB)"
-    final_text=$(call_whisper "$audio_full")
+    final_text=$(call_whisper "$audio_full") || chunk_failed=true
+    $SAVE_SRT && final_text=$(shift_srt 0 1 <<< "$final_text")
   else
     # 24MB 초과: 24MB 단위로 분할
     echo "  [TRANSCRIBE] 분할 처리 ($(( size / 1024 / 1024 ))MB)"
@@ -814,13 +1096,20 @@ transcribe_video() {
       local audio_chunk="${tmp_dir}/chunk_${chunk_num}.mp3"
 
       echo "  [TRANSCRIBE] 청크 ${chunk_num}/${total_chunks} (${offset}초~)..."
-      ffmpeg -i "$audio_full" -ss "$offset" -t "$chunk_sec" -c copy "$audio_chunk" -y -loglevel error
+      ffmpeg -nostdin -i "$audio_full" -ss "$offset" -t "$chunk_sec" -c copy "$audio_chunk" -y -loglevel error
 
       if [[ -f "$audio_chunk" ]]; then
         local chunk_text
-        chunk_text=$(call_whisper "$audio_chunk")
-        [[ -n "$chunk_text" ]] && final_text="${final_text}${chunk_text}"$'\n'
+        if chunk_text=$(call_whisper "$audio_chunk"); then
+          # 청크 안의 시각은 0초부터 시작하므로 청크 시작 위치만큼 민다 (번호는 저장할 때 다시 매긴다)
+          $SAVE_SRT && chunk_text=$(shift_srt "$offset" 1 <<< "$chunk_text")$'\n'
+          [[ -n "$chunk_text" ]] && final_text="${final_text}${chunk_text}"$'\n'
+        else
+          chunk_failed=true
+        fi
         rm -f "$audio_chunk"
+      else
+        chunk_failed=true
       fi
 
       offset=$((offset + chunk_sec))
@@ -830,11 +1119,25 @@ transcribe_video() {
 
   rm -rf "$tmp_dir"
 
-  if [[ -n "$final_text" ]]; then
-    echo "$final_text" > "$out_txt"
+  # 일부만 저장하면 다음 실행에서 "이미 transcribe됨"으로 건너뛰므로 전부 성공했을 때만 쓴다
+  if $chunk_failed; then
+    echo "  [TRANSCRIBE] 실패: 음성 인식 실패 (다음 실행 때 다시 시도)"
+    mark_failed "transcribe: $title"
+  elif $SAVE_SRT && ! grep -q ' --> ' <<< "$final_text"; then
+    echo "  [TRANSCRIBE] 실패: 서버가 srt 형식을 돌려주지 않음 (자막 저장을 끄거나 다른 서버를 쓰세요)"
+    mark_failed "transcribe: $title"
+  elif [[ -n "$final_text" ]]; then
+    if $SAVE_SRT; then
+      shift_srt 0 1 <<< "$final_text" > "$out_srt"
+      srt_to_text <<< "$final_text" > "$out_txt"
+      echo "  [TRANSCRIBE] 완료: $out_srt"
+    else
+      echo "$final_text" > "$out_txt"
+    fi
     echo "  [TRANSCRIBE] 완료: $out_txt"
   else
     echo "  [TRANSCRIBE] 실패: 결과 없음"
+    mark_failed "transcribe: $title"
   fi
 }
 
@@ -863,7 +1166,7 @@ process_course() {
 
     while true; do
       http_status=$(curl -s -o "$json_tmp" -w "%{http_code}" \
-        "${module_cookie_args[@]}" \
+        ${module_cookie_args[@]+"${module_cookie_args[@]}"} \
         -H "Authorization: Bearer ${CANVAS_TOKEN:-}" \
         -H "Referer: https://canvas.ssu.ac.kr/" \
         "$api_url")
@@ -907,11 +1210,11 @@ process_course() {
   course_http=$(curl -s \
     -o "$course_tmp" \
     -w "%{http_code}" \
-    "${course_cookie_args[@]}" \
+    ${course_cookie_args[@]+"${course_cookie_args[@]}"} \
     -H "Referer: https://canvas.ssu.ac.kr/" \
     -H "Authorization: Bearer ${CANVAS_TOKEN:-}" \
     "https://canvas.ssu.ac.kr/learningx/api/v1/courses/${course_id}")
-  course_name=$(jq -r '.name // ""' "$course_tmp" 2>/dev/null || true)
+  course_name=$(jq -r '.name // ""' "$course_tmp" 2>/dev/null | tr '/' '-' || true)
   rm -f "$course_tmp"
 
   local course_dir
@@ -937,8 +1240,12 @@ process_course() {
 
   jq -c '.[]' "$json_tmp" | while read -r module; do
     local week week_title item_count week_dir
-    week=$(jq <<< "$module" -r '.week_position')
-    week_title=$(jq <<< "$module" -r '.title')
+    week=$(jq <<< "$module" -r '.week_position // ""')
+    week_title=$(jq <<< "$module" -r '.title' | tr '/' '-')
+    # 일부 강의는 week_position이 비어 있으므로 "4주차" 같은 제목에서 주차 번호를 얻는다
+    if [[ -z "$week" && "$week_title" =~ ([0-9]+)주차 ]]; then
+      week="${BASH_REMATCH[1]}"
+    fi
 
     is_week_included "$week" || continue
 
@@ -953,7 +1260,7 @@ process_course() {
     echo "────────────────────────────────────────"
 
     jq <<< "$module" -c '.module_items[]?' | while read -r item; do
-      local content_type opened title inner_type view_url
+      local content_type opened title inner_type
       content_type=$(jq <<< "$item" -r '.content_type')
       [[ "$content_type" == "wiki_page" || "$content_type" == "quiz" || "$content_type" == "discussion" || "$content_type" == "assignment" ]] && continue
 
@@ -962,7 +1269,6 @@ process_course() {
 
       title=$(jq <<< "$item" -r '.title' | tr '/' '-')
       inner_type=$(jq <<< "$item" -r '.content_data.item_content_data.content_type')
-      view_url=$(jq <<< "$item" -r '.content_data.item_content_data.view_url // ""')
 
       echo ""
       echo " 항목: $title"
@@ -990,15 +1296,30 @@ process_course() {
 
         file|pdf)
           $DO_FILE || continue
-          [[ -z "$view_url" ]] && echo "  [SKIP] URL 없음 (미공개)" && continue
+          local file_content_id ext fname
+          file_content_id=$(jq <<< "$item" -r '.content_data.item_content_data.content_id // ""')
+          [[ -z "$file_content_id" || "$file_content_id" == "not_open" ]] && \
+            echo "  [SKIP] content_id 없음 (미공개)" && continue
 
-          local ext fname
+          # view_url(/em/<id>)은 문서 뷰어 HTML이므로, 뷰어의 다운로드 버튼과 같은 주소로 원본을 받는다
+          local file_url="https://commons.ssu.ac.kr/index.php?module=xn_media_content2013&act=dispXn_media_content2013DownloadContent&content_id=${file_content_id}"
+          local file_referer="https://commons.ssu.ac.kr/em/${file_content_id}"
+
           ext="${inner_type}"
-          [[ "$inner_type" == "file" ]] && {
-            fname=$(jq <<< "$item" -r '.content_data.item_content_data.file_name // ""')
-            ext="${fname##*.}"
-          }
-          download_file "$view_url" "${week_dir}/${title}.${ext}" "$title"
+          fname=$(jq <<< "$item" -r '.content_data.item_content_data.file_name // ""')
+          # 강의 정보에 파일 이름이 없으면 서버가 내려주는 파일 이름에서 확장자를 얻는다
+          [[ "$fname" != *.* ]] && fname=$(remote_filename "$file_url" "$file_referer")
+          [[ "$fname" == *.* ]] && ext="${fname##*.}"
+          download_file "$file_url" "${week_dir}/${title}.${ext}" "$title" "$file_referer"
+          ;;
+
+        embed)
+          $DO_FILE || continue
+          local embed_id
+          embed_id=$(jq <<< "$item" -r '.content_data.item_content_data.content_id // ""')
+          [[ -z "$embed_id" || "$embed_id" == "not_open" ]] && \
+            echo "  [SKIP] content_id 없음 (미공개)" && continue
+          save_link "$embed_id" "${week_dir}/${title}.webloc" "$title"
           ;;
 
         *)
@@ -1007,6 +1328,10 @@ process_course() {
       esac
     done
   done
+
+  if $DO_ATTACH && [[ -n "$course_id" ]]; then
+    download_attachments "$course_id" "$course_dir"
+  fi
 
   rm -f "$json_tmp"
   echo ""
@@ -1023,14 +1348,14 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 if [[ -n "$JSON_FILE" ]]; then
-  process_course "" "$JSON_FILE"
+  process_course "" "$JSON_FILE" || mark_failed "json: $JSON_FILE"
 else
   for course_id in "${COURSE_IDS[@]}"; do
     echo ""
     echo "########################################"
     echo " 강의 처리: $course_id"
     echo "########################################"
-    process_course "$course_id" ""
+    process_course "$course_id" "" || mark_failed "course: $course_id"
   done
 fi
 
@@ -1038,3 +1363,8 @@ echo ""
 echo "========================================"
 echo " 전체 완료. 출력: $OUTPUT_DIR"
 echo "========================================"
+
+if [[ -s "$FAIL_LOG" ]]; then
+  echo "Warning: 실패 $(wc -l < "$FAIL_LOG" | tr -d ' ')건"
+  exit 1
+fi

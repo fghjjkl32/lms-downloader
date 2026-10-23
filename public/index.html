@@ -22,26 +22,48 @@
     <!-- ── Settings Tab ──────────────────────────────────── -->
     <div class="tab-content active" id="tab-settings">
       <div class="card">
-        <div class="card-title"><span class="icon">&#128273;</span> API 키 설정</div>
+        <div class="card-title"><span class="icon">&#127908;</span> 음성 인식</div>
         <div class="form-group">
-          <label class="form-label">OpenAI API Key <span class="hint">(Whisper 음성 인식용)</span></label>
+          <label class="form-label">처리 방식</label>
+          <select class="form-input" id="transcribeEngine">
+            <option value="local">무료: 내 Mac에서 처리 (API 키 불필요)</option>
+            <option value="openai">OpenAI API 키 사용 (유료, 1시간에 약 500원)</option>
+            <option value="server">직접 지정한 서버 (VoiceStudio 등)</option>
+          </select>
+          <div class="hint engine-hint" data-engine="local" style="margin-top:6px;font-size:12px;color:var(--text-muted)">Apple Silicon Mac에서 동작합니다. 처음 한 번 엔진 설치(1~2분)와 모델 다운로드(1.6GB)가 필요하고, 1시간 강의는 3~4분 정도 걸립니다.</div>
+        </div>
+        <div class="form-group engine-field" data-engine="openai">
+          <label class="form-label">OpenAI API Key</label>
           <input type="password" class="form-input" id="openaiApiKey" placeholder="sk-...">
         </div>
-        <div class="form-group">
-          <label class="form-label">Canvas 토큰 <span class="hint">(설정 &gt; 액세스 토큰 - 강의 목록용)</span></label>
-          <input type="password" class="form-input" id="canvasToken" placeholder="64자리 액세스 토큰 입력">
-          <div class="token-status" id="standardTokenStatus"></div>
+        <div class="form-group engine-field" data-engine="server">
+          <label class="form-label">서버 주소 <span class="hint">(OpenAI 호환 /v1/audio/transcriptions)</span></label>
+          <input type="text" class="form-input" id="whisperUrl" placeholder="http://127.0.0.1:3900/v1/audio/transcriptions">
         </div>
+        <div class="form-group engine-field" data-engine="server">
+          <label class="form-label">모델 이름 <span class="hint">(비우면 whisper-1)</span></label>
+          <input type="text" class="form-input" id="whisperModel" placeholder="whisper-1">
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span class="icon">&#128273;</span> Canvas 인증</div>
         <div class="form-group">
-          <label class="form-label">Learningx 토큰 <span class="hint">(쿠키에서 자동 추출 - 영상 다운로드용)</span></label>
+          <label class="form-label">인증 상태 <span class="hint">(로그인 또는 쿠키에서 자동 추출)</span></label>
           <div class="token-status" id="learningxTokenStatus"></div>
         </div>
+      </div>
+
+      <div class="card" id="loginCard" style="display:none">
+        <div class="card-title"><span class="icon">&#128100;</span> Canvas 로그인</div>
+        <p class="hint" style="margin-bottom:12px">로그인 창에서 숭실대 계정으로 로그인하면 쿠키와 토큰을 자동으로 저장합니다. 창이 자동으로 닫히지 않으면 아무 강의나 열어 보세요.</p>
+        <button class="btn btn-primary" id="canvasLoginBtn" type="button">&#128273; Canvas 로그인</button>
       </div>
 
       <div class="card">
         <div class="card-title"><span class="icon">&#128193;</span> 경로 설정</div>
         <div class="form-group">
-          <label class="form-label">쿠키 파일 <span class="hint required-hint">(필수 - 영상/자료 다운로드에 필요)</span></label>
+          <label class="form-label">쿠키 파일 <span class="hint">(로그인을 쓰지 않을 때 직접 업로드)</span></label>
           <div class="upload-area" id="cookieUploadArea">
             <input type="file" id="cookieFileInput" accept=".txt,.cookie,.cookies" style="display:none">
             <button class="btn btn-secondary" id="cookieUploadBtn" type="button">&#128194; 쿠키 파일 업로드</button>
@@ -59,11 +81,10 @@
         </div>
         <div class="form-group">
           <label class="form-label">출력 디렉토리</label>
-          <input type="text" class="form-input" id="outputDir" placeholder="~/lms_output">
-        </div>
-        <div class="form-group">
-          <label class="form-label">스크립트 경로</label>
-          <input type="text" class="form-input" id="scriptPath" placeholder="~/lms_download.sh">
+          <div style="display:flex;gap:8px">
+            <input type="text" class="form-input" id="outputDir" placeholder="~/lms_output" style="flex:1">
+            <button class="btn btn-secondary" id="pickOutputDirBtn" type="button" style="display:none;white-space:nowrap">&#128194; 폴더 선택</button>
+          </div>
         </div>
       </div>
 
@@ -75,6 +96,9 @@
       <div class="card">
         <div class="card-title"><span class="icon">&#128218;</span> 내 강의 목록</div>
         <div class="select-all-row" style="margin-bottom:12px">
+          <select class="form-input" id="termSelect" style="width:auto;display:inline-block;padding:6px 10px;margin-right:8px">
+            <option value="">학기 불러오는 중...</option>
+          </select>
           <button class="btn btn-secondary btn-sm" id="loadCoursesBtn">&#128260; 강의 불러오기</button>
           <button class="btn btn-secondary btn-sm" id="selectAllBtn" style="margin-left:8px">전체 선택</button>
         </div>
@@ -107,10 +131,24 @@
             </div>
           </label>
           <label class="option-item">
+            <input type="checkbox" id="optAttach" checked>
+            <div>
+              <div class="option-label">&#128206; 공지·과제 첨부</div>
+              <div class="option-desc">공지와 과제에 올라온 첨부파일</div>
+            </div>
+          </label>
+          <label class="option-item">
             <input type="checkbox" id="optTranscribe" checked>
             <div>
               <div class="option-label">&#127908; 음성 인식</div>
               <div class="option-desc">Whisper로 자동 텍스트 변환</div>
+            </div>
+          </label>
+          <label class="option-item">
+            <input type="checkbox" id="optSrt">
+            <div>
+              <div class="option-label">&#127902; 자막(srt) 저장</div>
+              <div class="option-desc">음성 인식 결과를 시간별 자막으로도 저장</div>
             </div>
           </label>
           <label class="option-item">

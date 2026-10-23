@@ -3,13 +3,24 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const http = require('http');
 
 const app = express();
 const PORT = 8080;
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
-const DEFAULT_SCRIPT_PATH = path.join(__dirname, 'lms_download.sh');
+// The desktop app points this at its userData folder; `npm start` keeps using the repo folder
+const DATA_DIR = process.env.LMS_DATA_DIR || __dirname;
+const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
+const COOKIE_PATH = path.join(DATA_DIR, 'cookies.txt');
+const SCRIPT_PATH = path.join(__dirname, 'lms_download.sh');
+
+// Block DNS rebinding: only accept requests addressed to this machine
+const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`]);
+app.use((req, res, next) => {
+  if (!ALLOWED_HOSTS.has(req.headers.host)) {
+    return res.status(403).send('Forbidden');
+  }
+  next();
+});
 
 app.use(express.json());
 app.use(express.text({ type: 'text/plain', limit: '5mb' }));
@@ -29,6 +40,8 @@ function loadConfig() {
         }
         delete cfg.canvasToken;
       }
+      // scriptPath is no longer configurable: always run the bundled script
+      delete cfg.scriptPath;
       return { ...defaults, ...cfg };
     }
   } catch (e) {
@@ -42,12 +55,22 @@ const defaults = {
   standardToken: '',
   learningxToken: '',
   cookiesFile: '',
-  outputDir: path.join(__dirname, 'output'),
-  scriptPath: DEFAULT_SCRIPT_PATH,
+  // local: free on-device mlx-whisper, openai: paid API key, server: any OpenAI-compatible URL
+  transcribeEngine: 'local',
+  whisperUrl: '',
+  whisperModel: '',
+  outputDir: path.join(DATA_DIR, 'output'),
 };
 
+// Config and cookies hold secrets, so keep them readable by the owner only
+function writePrivateFile(filePath, content) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, { mode: 0o600 });
+  fs.chmodSync(filePath, 0o600);
+}
+
 function saveConfig(config) {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  writePrivateFile(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
 // ── JWT helpers ────────────────────────────────────────────
@@ -117,13 +140,13 @@ app.get('/api/config', (req, res) => {
   // Mask sensitive fields for display; expose non-secret paths as-is
   res.json({
     outputDir: config.outputDir,
-    scriptPath: config.scriptPath,
+    transcribeEngine: config.transcribeEngine,
+    whisperUrl: config.whisperUrl,
+    whisperModel: config.whisperModel,
     openaiApiKey: config.openaiApiKey ? '••••••' + config.openaiApiKey.slice(-4) : '',
-    standardToken: config.standardToken ? '••••••' + config.standardToken.slice(-8) : '',
     learningxToken: config.learningxToken ? '••••••' + config.learningxToken.slice(-8) : '',
     learningxTokenExpiry: config.learningxToken ? getJwtExpiry(config.learningxToken) : null,
     hasOpenaiKey: !!config.openaiApiKey,
-    hasStandardToken: !!config.standardToken,
     hasLearningxToken: !!config.learningxToken,
     cpuCores: require('os').cpus().length,
   });
@@ -136,13 +159,20 @@ app.post('/api/config', (req, res) => {
   if (req.body.openaiApiKey !== undefined && req.body.openaiApiKey !== '') {
     updated.openaiApiKey = req.body.openaiApiKey;
   }
-  // canvasToken from frontend is the standard /api/v1/ access token (64-char plain token)
-  if (req.body.canvasToken !== undefined && req.body.canvasToken !== '') {
-    updated.standardToken = req.body.canvasToken;
-  }
-  if (req.body.cookiesFile !== undefined) updated.cookiesFile = req.body.cookiesFile;
   if (req.body.outputDir !== undefined) updated.outputDir = req.body.outputDir;
-  if (req.body.scriptPath !== undefined) updated.scriptPath = req.body.scriptPath;
+  if (req.body.transcribeEngine !== undefined) {
+    if (!['local', 'openai', 'server'].includes(req.body.transcribeEngine)) {
+      return res.status(400).json({ error: '알 수 없는 음성 인식 방식입니다.' });
+    }
+    updated.transcribeEngine = req.body.transcribeEngine;
+  }
+  if (req.body.whisperUrl !== undefined) {
+    if (req.body.whisperUrl && !/^https?:\/\//.test(req.body.whisperUrl)) {
+      return res.status(400).json({ error: '음성 인식 서버 주소는 http:// 또는 https://로 시작해야 합니다.' });
+    }
+    updated.whisperUrl = req.body.whisperUrl;
+  }
+  if (req.body.whisperModel !== undefined) updated.whisperModel = req.body.whisperModel;
 
   saveConfig(updated);
   res.json({ success: true });
@@ -170,10 +200,10 @@ app.post('/api/config/upload-cookie', (req, res) => {
     if (!content.includes('ssu.ac.kr')) {
       return res.status(400).json({ error: '쿠키 파일에 ssu.ac.kr 쿠키가 없습니다. canvas.ssu.ac.kr에서 추출한 파일인지 확인해주세요.' });
     }
-    const cookiePath = path.join(__dirname, 'cookies.txt');
-    fs.writeFileSync(cookiePath, content);
+    const cookiePath = COOKIE_PATH;
+    writePrivateFile(cookiePath, content);
 
-    // Auto-extract xn_api_token as learningxToken (does NOT overwrite standardToken)
+    // Auto-extract xn_api_token as learningxToken
     const xnToken = extractXnToken(content);
     const config = loadConfig();
     config.cookiesFile = cookiePath;
@@ -207,27 +237,57 @@ app.get('/api/config/check-cookie', (req, res) => {
   return res.json({ valid: true, message: '쿠키 파일 확인 완료' });
 });
 
+// learningx 토큰과 사용자 ID를 꺼낸다. 실패하면 응답을 보내고 null을 돌려준다
+function requireLearningxUser(res) {
+  const token = loadConfig().learningxToken;
+  if (!token) {
+    res.status(400).json({ error: 'Canvas에 로그인하거나 쿠키 파일을 먼저 업로드해주세요.' });
+    return null;
+  }
+  const userId = getUserIdFromToken(token);
+  if (!userId) {
+    res.status(400).json({ error: '토큰에서 사용자 ID를 추출할 수 없습니다.' });
+    return null;
+  }
+  return { token, userId };
+}
+
+// Canvas API proxy: 학기 목록
+app.get('/api/canvas/terms', async (req, res) => {
+  try {
+    const auth = requireLearningxUser(res);
+    if (!auth) return;
+    const termsData = await canvasApiRequest(
+      `/learningx/api/v1/users/${auth.userId}/terms?include_invited_course_contained=true`,
+      auth.token
+    );
+    res.json((termsData.enrollment_terms || []).map((t) => ({ id: t.id, name: t.name })));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Canvas API proxy: 강의 목록 (learningx API 사용)
 app.get('/api/canvas/courses', async (req, res) => {
   try {
-    const config = loadConfig();
-    const token = config.learningxToken;
-    if (!token) return res.status(400).json({ error: '쿠키 파일을 먼저 업로드해주세요. (Learningx 토큰이 자동 추출됩니다)' });
+    const auth = requireLearningxUser(res);
+    if (!auth) return;
+    const { token } = auth;
 
-    // 1. JWT에서 user_login 추출
-    const userId = getUserIdFromToken(token);
-    if (!userId) return res.status(400).json({ error: '토큰에서 사용자 ID를 추출할 수 없습니다.' });
-
-    // 2. 학기 목록 가져오기
-    const termsData = await canvasApiRequest(
-      `/learningx/api/v1/users/${userId}/terms?include_invited_course_contained=true`,
-      token
-    );
-    const terms = termsData.enrollment_terms || [];
-    if (terms.length === 0) return res.json([]);
-
-    // 가장 최근 학기 사용
-    const termId = terms[0].id;
+    // termId가 없으면 가장 최근 학기를 쓴다
+    let termId = req.query.termId;
+    if (termId !== undefined && !/^\d+$/.test(termId)) {
+      return res.status(400).json({ error: '올바르지 않은 학기 ID 형식입니다.' });
+    }
+    if (termId === undefined) {
+      const termsData = await canvasApiRequest(
+        `/learningx/api/v1/users/${auth.userId}/terms?include_invited_course_contained=true`,
+        token
+      );
+      const terms = termsData.enrollment_terms || [];
+      if (terms.length === 0) return res.json([]);
+      termId = terms[0].id;
+    }
 
     // 3. 해당 학기 강의 목록 (todos)
     const todosData = await canvasApiRequest(
@@ -262,11 +322,30 @@ app.get('/api/canvas/courses', async (req, res) => {
 });
 
 // ── Download execution with SSE ────────────────────────────
-let currentProcess = null;
+// Each job runs in its own process group so stopping also kills its curl/ffmpeg children
+const activeJobs = new Set();
+let cancelCurrentRun = null;
+
+function killJob(child) {
+  try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+}
+
+function stopAllDownloads() {
+  for (const child of activeJobs) killJob(child);
+}
+
+// Detached jobs outlive the server unless killed explicitly
+process.on('exit', stopAllDownloads);
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    stopAllDownloads();
+    process.exit(0);
+  });
+}
 
 app.get('/api/download/start', (req, res) => {
-  // Prevent concurrent downloads
-  if (currentProcess !== null) {
+  // Prevent concurrent downloads (stopped jobs count until they actually exit)
+  if (activeJobs.size > 0) {
     res.status(409).json({ error: '이미 다운로드가 진행 중입니다.' });
     return;
   }
@@ -275,6 +354,8 @@ app.get('/api/download/start', (req, res) => {
 
   const doVideo = req.query.doVideo !== 'false';
   const doFile = req.query.doFile !== 'false';
+  const doAttach = req.query.doAttach !== 'false';
+  const doSrt = req.query.doSrt === 'true';
   const doTranscribe = req.query.doTranscribe !== 'false';
   const doCompress = req.query.doCompress === 'true';
   const compressSize = parseInt(req.query.compressSize) || 200;
@@ -320,7 +401,6 @@ app.get('/api/download/start', (req, res) => {
     res.write(`data: ${JSON.stringify({ type, data, courseId: courseId || null })}\n\n`);
   };
 
-  const scriptPath = config.scriptPath || DEFAULT_SCRIPT_PATH;
   const env = {
     ...process.env,
     CANVAS_TOKEN: config.learningxToken || '',
@@ -328,24 +408,23 @@ app.get('/api/download/start', (req, res) => {
     COOKIES_FILE: config.cookiesFile || '',
     FFMPEG_THREADS: String(cpuThreads),
   };
-
-  // Group courses by week filter to minimize script runs
-  const groups = {};
-  for (const [id, wf] of Object.entries(courseWeeks)) {
-    const key = wf || '';
-    if (!groups[key]) groups[key] = [];
-    groups[key].push(id);
-  }
+  env.TRANSCRIBE_ENGINE = config.transcribeEngine || 'local';
+  env.WHISPER_VENV = path.join(DATA_DIR, 'whisper-venv');
+  if (config.whisperUrl) env.WHISPER_URL = config.whisperUrl;
+  if (config.whisperModel) env.WHISPER_MODEL = config.whisperModel;
 
   // Each courseId gets its own script run (parallel)
-  const jobs = [];
-  for (const [id, wf] of Object.entries(courseWeeks)) {
-    jobs.push({ courseId: id, weekFilter: wf || '' });
-  }
+  const jobs = Object.entries(courseWeeks).map(([id, wf]) => ({ courseId: id, weekFilter: wf || '' }));
 
   let cancelled = false;
   const children = [];
   let completed = 0;
+
+  const cancelRun = () => {
+    cancelled = true;
+    for (const child of children) killJob(child);
+  };
+  cancelCurrentRun = cancelRun;
 
   sendEvent('status', `다운로드를 시작합니다... (${jobs.length}개 강의, 병렬 실행)`);
 
@@ -355,6 +434,8 @@ app.get('/api/download/start', (req, res) => {
     if (job.weekFilter) args.push('-w', job.weekFilter);
     if (!doVideo) args.push('--no-video');
     if (!doFile) args.push('--no-file');
+    if (!doAttach) args.push('--no-attach');
+    if (doSrt) args.push('--srt');
     if (!doTranscribe) args.push('--no-transcribe');
     if (doCompress) args.push('--compress-mb', String(compressSize));
     if (!openedOnly) args.push('--all');
@@ -362,82 +443,60 @@ app.get('/api/download/start', (req, res) => {
     const weekLabel = job.weekFilter ? `${job.weekFilter}주차` : '전체';
     sendEvent('course_start', weekLabel, job.courseId);
 
-    const child = spawn('bash', [scriptPath, ...args], { env, cwd: process.env.HOME });
+    const child = spawn('bash', [SCRIPT_PATH, ...args], { env, cwd: process.env.HOME, detached: true });
     children.push(child);
+    activeJobs.add(child);
 
-    child.stdout.on('data', (data) => {
+    const forwardOutput = (data) => {
       if (cancelled) return;
       const lines = data.toString().split('\n').filter(Boolean);
       for (const line of lines) {
         const parsed = parseLine(line);
         sendEvent(parsed.type, parsed.text, job.courseId);
       }
-    });
+    };
+    child.stdout.on('data', forwardOutput);
+    child.stderr.on('data', forwardOutput);
 
-    child.stderr.on('data', (data) => {
-      if (cancelled) return;
-      const lines = data.toString().split('\n').filter(Boolean);
-      for (const line of lines) {
-        const parsed = parseLine(line);
-        sendEvent(parsed.type, parsed.text, job.courseId);
+    // 'error' and 'close' can both fire for one child; count it once
+    let finished = false;
+    const finishJob = () => {
+      if (finished) return;
+      finished = true;
+      activeJobs.delete(child);
+      completed++;
+      if (completed >= jobs.length) {
+        if (cancelCurrentRun === cancelRun) cancelCurrentRun = null;
+        sendEvent(cancelled ? 'cancelled' : 'complete',
+          cancelled ? '다운로드가 취소되었습니다.' : '모든 다운로드가 완료되었습니다.');
+        res.end();
       }
-    });
+    };
 
     child.on('close', (code) => {
-      completed++;
-      if (code === null && !cancelled) {
+      if (code === null) {
         sendEvent('course_done', '취소됨', job.courseId);
       } else {
         sendEvent('course_done', `완료 (종료 코드: ${code})`, job.courseId);
       }
-
-      if (completed >= jobs.length) {
-        currentProcess = null;
-        if (cancelled) {
-          sendEvent('cancelled', '다운로드가 취소되었습니다.');
-        } else {
-          sendEvent('complete', '모든 다운로드가 완료되었습니다.');
-        }
-        res.end();
-      }
+      finishJob();
     });
 
     child.on('error', (err) => {
-      completed++;
       sendEvent('error', `강의 ${job.courseId} 실행 오류: ${err.message}`);
-      if (completed >= jobs.length) {
-        currentProcess = null;
-        res.end();
-      }
+      finishJob();
     });
   }
 
-  activeChildren = children;
-  currentProcess = children[0] || null;
-
-  req.on('close', () => {
-    cancelled = true;
-    for (const child of children) {
-      try { child.kill('SIGTERM'); } catch {}
-    }
-    activeChildren = [];
-    currentProcess = null;
+  // req 'close' fires once the request is read on recent Node, so watch the response instead
+  res.on('close', () => {
+    if (!res.writableEnded) cancelRun();
   });
 });
 
-let activeChildren = [];
-
 app.post('/api/download/stop', (req, res) => {
-  if (activeChildren.length > 0) {
-    for (const child of activeChildren) {
-      try { child.kill('SIGTERM'); } catch {}
-    }
-    activeChildren = [];
-    currentProcess = null;
-    res.json({ success: true, message: '다운로드가 취소되었습니다.' });
-  } else if (currentProcess) {
-    currentProcess.kill('SIGTERM');
-    currentProcess = null;
+  if (cancelCurrentRun) {
+    cancelCurrentRun();
     res.json({ success: true, message: '다운로드가 취소되었습니다.' });
   } else {
     res.json({ success: false, message: '실행 중인 다운로드가 없습니다.' });
@@ -479,6 +538,18 @@ function parseLine(line) {
 }
 
 // ── Start server ───────────────────────────────────────────
-app.listen(PORT, '127.0.0.1', () => {
+const server = app.listen(PORT, '127.0.0.1', () => {
   console.log(`LMS Downloader GUI running at http://localhost:${PORT}`);
 });
+
+// Lets the desktop app wait for the server (or learn the port is taken)
+const ready = new Promise((resolve, reject) => {
+  server.once('listening', resolve);
+  server.once('error', reject);
+});
+ready.catch((err) => {
+  console.error(`Server failed to start: ${err.message}`);
+  if (require.main === module) process.exit(1);
+});
+
+module.exports = { PORT, ready, stopAllDownloads };

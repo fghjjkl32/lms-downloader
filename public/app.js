@@ -62,9 +62,11 @@ async function loadConfig() {
     const res = await fetch('/api/config');
     const config = await res.json();
     $('#openaiApiKey').placeholder = config.hasOpenaiKey ? '(설정됨) 변경하려면 새로 입력' : 'sk-...';
-    $('#canvasToken').placeholder = config.hasStandardToken ? '(설정됨) 변경하려면 새로 입력' : '64자리 액세스 토큰 입력';
     $('#outputDir').value = config.outputDir || '';
-    $('#scriptPath').value = config.scriptPath || '';
+    $('#transcribeEngine').value = config.transcribeEngine || 'local';
+    updateEngineFields();
+    $('#whisperUrl').value = config.whisperUrl || '';
+    $('#whisperModel').value = config.whisperModel || '';
     if (config.cpuCores) {
       $('#cpuThreads').max = config.cpuCores;
       $('#cpuThreadsMax').textContent = config.cpuCores;
@@ -80,27 +82,17 @@ async function updateTokenStatus() {
     const res = await fetch('/api/config');
     const config = await res.json();
 
-    // Standard token status
-    const stdEl = $('#standardTokenStatus');
-    if (stdEl) {
-      if (!config.hasStandardToken) {
-        stdEl.innerHTML = '<span class="badge badge-warning">&#9888; 미설정 - 강의 목록을 불러오려면 입력 필요</span>';
-      } else {
-        stdEl.innerHTML = '<span class="badge badge-success">&#10004; 설정됨</span>';
-      }
-    }
-
     // Learningx token status (JWT with expiry)
     const lxEl = $('#learningxTokenStatus');
     if (lxEl) {
       if (!config.hasLearningxToken) {
-        lxEl.innerHTML = '<span class="badge badge-warning">&#9888; 미설정 - 쿠키 파일을 업로드하면 자동 추출됩니다</span>';
+        lxEl.innerHTML = '<span class="badge badge-warning">&#9888; 미설정 - Canvas에 로그인하거나 쿠키 파일을 업로드하면 자동 추출됩니다</span>';
       } else if (config.learningxTokenExpiry) {
         const expiry = new Date(config.learningxTokenExpiry);
         const now = new Date();
         const diffHours = (expiry - now) / (1000 * 60 * 60);
         if (diffHours < 0) {
-          lxEl.innerHTML = '<span class="badge badge-error">&#10006; 만료됨 - 쿠키를 다시 업로드해주세요</span>';
+          lxEl.innerHTML = '<span class="badge badge-error">&#10006; 만료됨 - 다시 로그인해주세요</span>';
         } else if (diffHours < 24) {
           lxEl.innerHTML = `<span class="badge badge-warning">&#9888; ${Math.floor(diffHours)}시간 후 만료</span>`;
         } else {
@@ -119,14 +111,13 @@ async function updateTokenStatus() {
 $('#saveConfigBtn').addEventListener('click', async () => {
   const data = {};
   const openaiKey = $('#openaiApiKey').value.trim();
-  const canvasToken = $('#canvasToken').value.trim();
   const outputDir = $('#outputDir').value.trim();
-  const scriptPath = $('#scriptPath').value.trim();
 
   if (openaiKey) data.openaiApiKey = openaiKey;
-  if (canvasToken) data.canvasToken = canvasToken;
   data.outputDir = outputDir;
-  data.scriptPath = scriptPath;
+  data.transcribeEngine = $('#transcribeEngine').value;
+  data.whisperUrl = $('#whisperUrl').value.trim();
+  data.whisperModel = $('#whisperModel').value.trim();
 
   try {
     const res = await fetch('/api/config', {
@@ -139,7 +130,6 @@ $('#saveConfigBtn').addEventListener('click', async () => {
     if (res.ok) {
       showToast('설정이 저장되었습니다.');
       $('#openaiApiKey').value = '';
-      $('#canvasToken').value = '';
       loadConfig();
       checkCookieStatus();
     } else {
@@ -149,6 +139,60 @@ $('#saveConfigBtn').addEventListener('click', async () => {
     showToast('서버 오류', 'error');
   }
 });
+
+// ── Transcription engine ───────────────────────────────────
+// 고른 방식에 필요한 입력란만 보여 준다
+function updateEngineFields() {
+  const engine = $('#transcribeEngine').value;
+  $$('.engine-field, .engine-hint').forEach((el) => {
+    el.style.display = el.dataset.engine === engine ? '' : 'none';
+  });
+}
+$('#transcribeEngine').addEventListener('change', updateEngineFields);
+
+// ── Output folder picker (desktop app only) ────────────────
+// 앱에서는 Finder 폴더 선택 창으로 고르고 바로 저장한다. 브라우저에서는 경로를 직접 입력한다
+if (window.lmsApp) {
+  $('#outputDir').readOnly = true;
+  $('#pickOutputDirBtn').style.display = '';
+  $('#pickOutputDirBtn').addEventListener('click', async () => {
+    const dir = await window.lmsApp.pickFolder($('#outputDir').value);
+    if (!dir) return;
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ outputDir: dir }),
+      });
+      if (!res.ok) throw new Error((await res.json()).error || '저장 실패');
+      $('#outputDir').value = dir;
+      showToast('출력 폴더를 저장했습니다.');
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+  });
+}
+
+// ── Canvas login (desktop app only) ───────────────────────
+// The preload script exposes window.lmsApp; a plain browser tab falls back to cookie upload
+if (window.lmsApp) {
+  $('#loginCard').style.display = 'block';
+  $('#canvasLoginBtn').addEventListener('click', async () => {
+    const btn = $('#canvasLoginBtn');
+    btn.disabled = true;
+    try {
+      const result = await window.lmsApp.login();
+      showToast(result.message, result.ok ? 'success' : 'error');
+      checkCookieStatus();
+      updateTokenStatus();
+      loadTerms();
+    } catch (e) {
+      showToast(`로그인 실패: ${e.message}`, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
 
 // ── Cookie upload ──────────────────────────────────────────
 $('#cookieUploadBtn').addEventListener('click', () => $('#cookieFileInput').click());
@@ -182,6 +226,8 @@ async function uploadCookieFile(file) {
     if (res.ok) {
       showToast(data.message);
       checkCookieStatus();
+      updateTokenStatus();
+      loadTerms();
     } else {
       showToast(data.error || '업로드 실패', 'error');
     }
@@ -208,13 +254,31 @@ async function checkCookieStatus() {
 
 // ── Courses ─────────────────────────────────────────────────
 $('#loadCoursesBtn').addEventListener('click', loadCourses);
+$('#termSelect').addEventListener('change', loadCourses);
+
+async function loadTerms() {
+  const select = $('#termSelect');
+  try {
+    const res = await fetch('/api/canvas/terms');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'API 오류');
+    select.innerHTML = data.map((t) => `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');
+  } catch {
+    // 로그인 전에는 목록이 없으므로 최근 학기로 불러오게 둔다
+    select.innerHTML = '<option value="">최근 학기</option>';
+  }
+}
 
 async function loadCourses() {
   const courseList = $('#courseList');
   courseList.innerHTML = '<div class="loading"><div class="spinner"></div> 강의 불러오는 중...</div>';
+  // 목록을 새로 그리면 이전에 고른 강의 체크박스가 사라지므로 선택도 비운다
+  updateSelectedCourses();
+  $('#selectAllBtn').textContent = '전체 선택';
 
   try {
-    const res = await fetch('/api/canvas/courses');
+    const termId = $('#termSelect').value;
+    const res = await fetch(termId ? `/api/canvas/courses?termId=${termId}` : '/api/canvas/courses');
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.error || 'API 오류');
@@ -375,6 +439,8 @@ async function startDownload() {
   params.set('courseWeeks', JSON.stringify(courseWeeks));
   params.set('doVideo', $('#optVideo').checked);
   params.set('doFile', $('#optFile').checked);
+  params.set('doAttach', $('#optAttach').checked);
+  params.set('doSrt', $('#optSrt').checked);
   params.set('doTranscribe', $('#optTranscribe').checked);
   params.set('doCompress', $('#optCompress').checked);
   params.set('compressSize', $('#compressSize').value);
@@ -417,7 +483,7 @@ async function startDownload() {
   eventSource.onerror = () => {
     if (state.isDownloading) {
       finishDownload('error');
-      appendLog('error', '서버와의 연결이 끊어졌습니다.');
+      showToast('서버와의 연결이 끊어졌습니다.', 'error');
     }
   };
 }
@@ -454,7 +520,6 @@ async function stopDownload() {
     state.eventSource = null;
   }
   finishDownload('cancelled');
-  appendLog('cancelled', '사용자에 의해 중지되었습니다.');
 }
 
 function appendCourseLog(courseId, type, text) {
@@ -537,5 +602,6 @@ $('#cpuThreads').addEventListener('input', () => {
 
 // ── Init ────────────────────────────────────────────────────
 loadConfig();
+loadTerms();
 checkCookieStatus();
 updateSelectedSummary();
