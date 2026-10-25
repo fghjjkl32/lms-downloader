@@ -432,7 +432,8 @@ app.get('/api/download/start', (req, res) => {
     const args = ['-c', job.courseId];
     if (config.outputDir) args.push('-o', config.outputDir);
     if (job.weekFilter) args.push('-w', job.weekFilter);
-    if (!doVideo) args.push('--no-video');
+    // 영상을 끄고 음성 인식만 켜면 영상은 임시로 받아 변환한 뒤 지운다
+    if (!doVideo) args.push(doTranscribe ? '--no-keep-video' : '--no-video');
     if (!doFile) args.push('--no-file');
     if (!doAttach) args.push('--no-attach');
     if (doSrt) args.push('--srt');

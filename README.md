@@ -146,6 +146,9 @@ bash lms_download.sh -c 44114 --no-transcribe --no-file
 
 # 자료만
 bash lms_download.sh -c 44114 --no-video
+
+# 음성 인식 결과만 (영상은 저장하지 않음)
+bash lms_download.sh -c 44114 --no-keep-video --no-file --no-attach
 ```
 
 자세한 옵션은 `bash lms_download.sh --help` 참조

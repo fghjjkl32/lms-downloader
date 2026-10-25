@@ -25,6 +25,8 @@ OUTPUT_DIR="./lms_output"
 JSON_FILE=""
 WEEK_FILTER=""
 DO_VIDEO=true
+# false면 영상은 음성 인식에만 쓰고 저장하지 않는다
+KEEP_VIDEO=true
 DO_FILE=true
 DO_ATTACH=true
 SAVE_SRT=false
@@ -54,6 +56,7 @@ Usage: $(basename "$0") [옵션]
   -o <dir>         출력 디렉토리 (기본: ./lms_output)
   -w <n>           특정 주차만 처리 (예: -w 1 또는 -w 1,2,3)
   --no-video       영상 다운로드/transcribe 건너뜀
+  --no-keep-video  영상은 저장하지 않고 transcribe만 (임시로 받은 뒤 삭제)
   --no-file        자료 파일 다운로드 건너뜀
   --no-attach      공지·과제 첨부파일 다운로드 건너뜀
   --srt            음성 인식 결과를 .srt 자막으로도 저장
@@ -110,6 +113,7 @@ while [[ $# -gt 0 ]]; do
     -o) OUTPUT_DIR="$2"; shift 2 ;;
     -w) WEEK_FILTER="$2"; shift 2 ;;
     --no-video) DO_VIDEO=false; shift ;;
+    --no-keep-video) KEEP_VIDEO=false; shift ;;
     --no-file) DO_FILE=false; shift ;;
     --no-attach) DO_ATTACH=false; shift ;;
     --srt) SAVE_SRT=true; shift ;;
@@ -1283,6 +1287,27 @@ process_course() {
             echo "  [SKIP] content_id 없음 (미공개)" && continue
 
           local video_path
+          if ! $KEEP_VIDEO; then
+            $DO_TRANSCRIBE || continue
+            local out_txt="${week_dir}/${title}.txt"
+            if [[ -f "$out_txt" ]] && { ! $SAVE_SRT || [[ -f "${out_txt%.txt}.srt" ]]; }; then
+              echo "  [SKIP] 이미 transcribe됨: $title"
+              continue
+            fi
+            mkdir -p "$week_dir"
+            # 예전에 받아 둔 영상이 있으면 다시 받지 않는다
+            if [[ -f "${week_dir}/${title}.mp4" ]]; then
+              transcribe_video "${week_dir}/${title}.mp4" "$out_txt" "$title"
+            else
+              local tmp_video_dir
+              tmp_video_dir=$(mktemp -d)
+              video_path=$(download_video "$local_content_id" "$tmp_video_dir" "$title")
+              [[ -n "$video_path" ]] && transcribe_video "$video_path" "$out_txt" "$title"
+              rm -rf "$tmp_video_dir"
+            fi
+            continue
+          fi
+
           video_path=$(download_video "$local_content_id" "$week_dir" "$title")
 
           if $DO_COMPRESS && [[ -n "$video_path" ]]; then
