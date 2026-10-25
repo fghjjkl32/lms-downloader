@@ -5,6 +5,8 @@ const state = {
   selectedTermId: null,
   isDownloading: false,
   eventSource: null,
+  problems: [],          // failures and attachments that cannot be downloaded, for the current run
+  lastNotifyAt: 0,
 };
 
 // ── DOM refs ────────────────────────────────────────────────
@@ -443,6 +445,8 @@ async function startDownload() {
   $('#progressLabel').textContent = '다운로드 준비 중...';
   $('#progressCounter').textContent = '';
 
+  resetProblems();
+
   // Build per-course progress panels
   const progressList = $('#courseProgressList');
   progressList.innerHTML = '';
@@ -509,16 +513,20 @@ async function startDownload() {
         $('#progressLabel').textContent = `다운로드 중... (${completedCount}/${totalCourses})`;
       } else if (msg.type === 'course_done' && cid) {
         completedCount++;
-        const isDoneOk = msg.data.includes('종료 코드: 0');
-        updateCoursePanel(cid, isDoneOk ? 'done' : 'error', msg.data);
+        updateCoursePanel(cid, msg.ok ? 'done' : 'error', msg.data);
         $('#progressCounter').textContent = `${completedCount}/${totalCourses}`;
         $('#progressLabel').textContent = `다운로드 중... (${completedCount}/${totalCourses})`;
       } else if (msg.type === 'complete' || msg.type === 'cancelled') {
         finishDownload(msg.type);
       } else if (cid) {
-        appendCourseLog(cid, msg.type, msg.data);
+        appendCourseLog(cid, msg.type === 'fail' ? 'fail' : msg.type, msg.type === 'fail' ? `실패: ${msg.data}` : msg.data);
         if (msg.type === 'download' || msg.type === 'transcribe') {
           updateCourseStatusText(cid, msg.data);
+        }
+        if (msg.type === 'fail') {
+          addProblem(cid, msg.data, 'fail');
+        } else if (msg.type === 'error' || (msg.type === 'warning' && msg.data.includes('받을 수 없음'))) {
+          addProblem(cid, msg.data, msg.type);
         }
       }
     } catch {
@@ -544,9 +552,16 @@ function finishDownload(finalType) {
   $('#stopBtn').style.display = 'none';
   $('#progressSpinner').style.display = 'none';
 
-  if (finalType === 'complete') {
+  const failed = state.problems.filter((p) => p.level === 'fail' || p.level === 'error').length;
+  if (finalType === 'complete' && failed > 0) {
+    $('#progressLabel').textContent = `완료, 실패 ${failed}건`;
+    showToast(`다운로드를 마쳤지만 ${failed}건이 실패했습니다. 아래 목록에서 원인을 확인해 주세요.`, 'error');
+    notify('다운로드 완료 (실패 있음)', `${failed}건을 받지 못했습니다. 앱에서 원인을 확인해 주세요.`);
+    $('#problemCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else if (finalType === 'complete') {
     $('#progressLabel').textContent = '완료!';
     showToast('다운로드가 완료되었습니다.');
+    notify('다운로드 완료', '선택한 강의를 모두 받았습니다.');
   } else if (finalType === 'cancelled') {
     $('#progressLabel').textContent = '취소됨';
     showToast('다운로드가 취소되었습니다.', 'error');
@@ -566,6 +581,87 @@ async function stopDownload() {
     state.eventSource = null;
   }
   finishDownload('cancelled');
+}
+
+// ── Problems ────────────────────────────────────────────────
+const PROBLEM_KINDS = {
+  video: '영상', file: '자료', transcribe: '음성 인식', compress: '압축',
+  link: '링크', attach: '첨부', course: '강의', json: '강의',
+};
+
+function resetProblems() {
+  state.problems = [];
+  state.lastNotifyAt = 0;
+  $('#problemList').innerHTML = '';
+  $('#problemCard').style.display = 'none';
+}
+
+// fail lines look like "video: 1강 개요 :: 응답 시간 초과: ..."
+function parseProblem(text, level) {
+  if (level === 'fail') {
+    const [head, ...rest] = text.split(' :: ');
+    const m = head.match(/^(\w+):\s*(.*)$/);
+    return {
+      kind: m ? (PROBLEM_KINDS[m[1]] || m[1]) : '오류',
+      item: m ? m[2] : head,
+      reason: rest.join(' :: ') || '원인을 알 수 없음',
+    };
+  }
+  if (level === 'warning') {
+    const body = text.replace(/^\[SKIP\]\s*첨부를 받을 수 없음:\s*/, '');
+    const [item, ...rest] = body.split(' :: ');
+    return { kind: '첨부', item, reason: rest.join(' :: ') || body };
+  }
+  return { kind: '오류', item: '', reason: text.replace(/^Error:\s*/, '') };
+}
+
+function addProblem(courseId, text, level) {
+  const p = { courseId, level, ...parseProblem(text, level) };
+  state.problems.push(p);
+  const course = state.selectedCourses.find((c) => c.courseId === courseId);
+  const row = document.createElement('div');
+  row.className = 'problem-row';
+  row.innerHTML = `
+    <div class="problem-head">
+      <span class="problem-kind ${level === 'warning' ? 'warn' : ''}">${escapeHtml(p.kind)}</span>
+      <span class="problem-item">${escapeHtml(p.item)}</span>
+      <span class="problem-course">${escapeHtml(course ? course.courseName : courseId)}</span>
+    </div>
+    <div class="problem-reason">${escapeHtml(p.reason)}</div>`;
+  $('#problemList').appendChild(row);
+  $('#problemCard').style.display = 'block';
+  const failed = state.problems.filter((x) => x.level !== 'warning').length;
+  const warned = state.problems.length - failed;
+  $('#problemCount').textContent = [failed && `실패 ${failed}`, warned && `받을 수 없음 ${warned}`].filter(Boolean).join(' · ');
+
+  if (level !== 'warning') {
+    showToast(`${p.kind} 실패: ${p.item}`, 'error');
+    // Downloads run for a long time in the background; tell the user without flooding them
+    if (Date.now() - state.lastNotifyAt > 30000) {
+      state.lastNotifyAt = Date.now();
+      notify(`${p.kind} 실패: ${p.item}`, p.reason);
+    }
+  }
+}
+
+function notify(title, body) {
+  try {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'granted') {
+      new Notification(title, { body });
+    } else if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then((perm) => {
+        if (perm === 'granted') new Notification(title, { body });
+      });
+    }
+  } catch {
+    // notifications are a convenience only
+  }
+}
+
+if (window.lmsApp) {
+  $('#openLogsBtn').style.display = '';
+  $('#openLogsBtn').addEventListener('click', () => window.lmsApp.openLogs());
 }
 
 function appendCourseLog(courseId, type, text) {

@@ -523,6 +523,11 @@ header h1 .logo-icon {
   color: var(--error);
 }
 
+.log-line.type-fail {
+  color: var(--error);
+  font-weight: 600;
+}
+
 .log-line.type-warning {
   color: var(--warning);
 }
@@ -990,4 +995,64 @@ header h1 .logo-icon {
 .option-item.disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ── Problems ────────────────────────────────────────────── */
+.problem-card {
+  border-color: var(--error);
+}
+
+.problem-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--error);
+  background: var(--error-light);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.problem-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-light);
+  font-size: 13px;
+}
+
+.problem-row:last-child {
+  border-bottom: none;
+}
+
+.problem-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.problem-kind {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--error-light);
+  color: var(--error);
+}
+
+.problem-kind.warn {
+  background: var(--warning-light);
+  color: var(--warning);
+}
+
+.problem-course {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.problem-item {
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.problem-reason {
+  margin-top: 4px;
+  color: var(--text-secondary);
 }

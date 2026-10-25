@@ -12,6 +12,9 @@ const DATA_DIR = process.env.LMS_DATA_DIR || __dirname;
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const COOKIE_PATH = path.join(DATA_DIR, 'cookies.txt');
 const SCRIPT_PATH = path.join(__dirname, 'lms_download.sh');
+// Every run is saved here so failures can be checked after the window is closed
+const LOG_DIR = path.join(DATA_DIR, 'logs');
+const MAX_LOG_FILES = 30;
 
 // Block DNS rebinding: only accept requests addressed to this machine
 const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`]);
@@ -397,8 +400,16 @@ app.get('/api/download/start', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const sendEvent = (type, data, courseId) => {
-    res.write(`data: ${JSON.stringify({ type, data, courseId: courseId || null })}\n\n`);
+  const logFile = openRunLog();
+  const sendEvent = (type, data, courseId, extra = {}) => {
+    res.write(`data: ${JSON.stringify({ type, data, courseId: courseId || null, ...extra })}\n\n`);
+    if (logFile !== null) {
+      try {
+        fs.writeSync(logFile, `${new Date().toLocaleTimeString('en-GB')} [${courseId || '전체'}] ${type}: ${data}\n`);
+      } catch {
+        // logging must never break the download
+      }
+    }
   };
 
   const env = {
@@ -445,14 +456,18 @@ app.get('/api/download/start', (req, res) => {
     sendEvent('course_start', weekLabel, job.courseId);
 
     const child = spawn('bash', [SCRIPT_PATH, ...args], { env, cwd: process.env.HOME, detached: true });
+    let failCount = 0;
     children.push(child);
     activeJobs.add(child);
 
     const forwardOutput = (data) => {
       if (cancelled) return;
-      const lines = data.toString().split('\n').filter(Boolean);
+      const lines = data.toString().split(/[\r\n]+/).filter((l) => l.trim());
       for (const line of lines) {
         const parsed = parseLine(line);
+        // curl's percentage is unreliable for these CDN downloads, so the bar is not shown
+        if (parsed.type === 'progress') continue;
+        if (parsed.type === 'fail') failCount++;
         sendEvent(parsed.type, parsed.text, job.courseId);
       }
     };
@@ -470,15 +485,20 @@ app.get('/api/download/start', (req, res) => {
         if (cancelCurrentRun === cancelRun) cancelCurrentRun = null;
         sendEvent(cancelled ? 'cancelled' : 'complete',
           cancelled ? '다운로드가 취소되었습니다.' : '모든 다운로드가 완료되었습니다.');
+        if (logFile !== null) fs.closeSync(logFile);
         res.end();
       }
     };
 
     child.on('close', (code) => {
       if (code === null) {
-        sendEvent('course_done', '취소됨', job.courseId);
+        sendEvent('course_done', '취소됨', job.courseId, { ok: false, failCount });
+      } else if (code === 0) {
+        sendEvent('course_done', '완료', job.courseId, { ok: true, failCount });
+      } else if (failCount > 0) {
+        sendEvent('course_done', `완료, 실패 ${failCount}건`, job.courseId, { ok: false, failCount });
       } else {
-        sendEvent('course_done', `완료 (종료 코드: ${code})`, job.courseId);
+        sendEvent('course_done', `중단됨 (종료 코드 ${code}): 로그의 Error 줄을 확인해 주세요`, job.courseId, { ok: false, failCount });
       }
       finishJob();
     });
@@ -505,8 +525,34 @@ app.post('/api/download/stop', (req, res) => {
 });
 
 // ── Line parser ────────────────────────────────────────────
+function openRunLog() {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const old = fs.readdirSync(LOG_DIR).filter((f) => f.endsWith('.log')).sort();
+    for (const f of old.slice(0, Math.max(0, old.length - MAX_LOG_FILES + 1))) fs.rmSync(path.join(LOG_DIR, f));
+    // Local time, so the file name matches what the user remembers
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+    return fs.openSync(path.join(LOG_DIR, `${stamp}.log`), 'a', 0o600);
+  } catch {
+    return null;
+  }
+}
+
 function parseLine(line) {
   const trimmed = line.trim();
+
+  // curl --progress-bar redraws one line with \r; drop the bar so the log stays readable
+  const bar = trimmed.match(/^#*\s*(\d+(?:\.\d+)?)%$/);
+  if (bar) return { type: 'progress', text: bar[1] };
+  if (/^[#=O\-\s]+$/.test(trimmed)) return { type: 'progress', text: '' };
+  if (trimmed.startsWith('[FAIL]')) {
+    return { type: 'fail', text: trimmed.slice('[FAIL]'.length).trim() };
+  }
+  if (trimmed.startsWith('[SKIP] 첨부를 받을 수 없음')) {
+    return { type: 'warning', text: trimmed };
+  }
 
   if (trimmed.startsWith('[VIDEO] 완료') || trimmed.startsWith('[FILE] 완료') || trimmed.startsWith('[TRANSCRIBE] 완료') || trimmed.startsWith('[MD] 완료')) {
     return { type: 'success', text: trimmed };

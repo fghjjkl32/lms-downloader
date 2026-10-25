@@ -241,6 +241,12 @@ async function askAndInstallDeps(reason) {
 }
 
 ipcMain.handle('deps-status', () => deps.status());
+// Run logs are written by the server into userData/logs
+ipcMain.handle('open-logs', async () => {
+  const dir = path.join(app.getPath('userData'), 'logs');
+  require('fs').mkdirSync(dir, { recursive: true });
+  return shell.openPath(dir);
+});
 ipcMain.handle('deps-install', () => installDeps());
 ipcMain.handle('deps-ensure', () => askAndInstallDeps('다운로드를 시작하려면 아래 도구가 필요합니다.'));
 
