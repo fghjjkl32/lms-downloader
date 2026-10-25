@@ -887,3 +887,107 @@ header h1 .logo-icon {
   animation: spin 0.8s linear infinite;
   flex-shrink: 0;
 }
+
+/* ── Required tools ──────────────────────────────────────── */
+.dep-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-light);
+  font-size: 14px;
+}
+
+.dep-row:last-child {
+  border-bottom: none;
+}
+
+.dep-name {
+  font-weight: 600;
+  min-width: 70px;
+}
+
+.dep-purpose {
+  flex: 1;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.dep-state {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.dep-state.ok {
+  color: var(--success);
+  background: var(--success-light);
+}
+
+.dep-state.missing {
+  color: var(--error);
+  background: var(--error-light);
+}
+
+/* ── File preview ────────────────────────────────────────── */
+.file-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.file-kind {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--accent-light);
+  color: var(--accent);
+}
+
+.file-tree {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.9;
+  overflow-x: auto;
+}
+
+.tree-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.tree-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.tree-desc {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.tree-empty {
+  color: var(--text-muted);
+}
+
+.file-notes {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.file-notes p {
+  margin: 4px 0;
+}
+
+.option-item.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

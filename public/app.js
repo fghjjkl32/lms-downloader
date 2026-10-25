@@ -63,6 +63,7 @@ async function loadConfig() {
     const config = await res.json();
     $('#openaiApiKey').placeholder = config.hasOpenaiKey ? '(설정됨) 변경하려면 새로 입력' : 'sk-...';
     $('#outputDir').value = config.outputDir || '';
+    renderFilePreview();
     $('#transcribeEngine').value = config.transcribeEngine || 'local';
     updateEngineFields();
     $('#whisperUrl').value = config.whisperUrl || '';
@@ -166,6 +167,7 @@ if (window.lmsApp) {
       });
       if (!res.ok) throw new Error((await res.json()).error || '저장 실패');
       $('#outputDir').value = dir;
+      renderFilePreview();
       showToast('출력 폴더를 저장했습니다.');
     } catch (e) {
       showToast(e.message, 'error');
@@ -190,6 +192,39 @@ if (window.lmsApp) {
       showToast(`로그인 실패: ${e.message}`, 'error');
     } finally {
       btn.disabled = false;
+    }
+  });
+}
+
+// ── Required tools (desktop app only) ─────────────────────
+async function loadDeps() {
+  const tools = await window.lmsApp.depsStatus();
+  $('#depsList').innerHTML = tools.map((t) =>
+    `<div class="dep-row">
+      <span class="dep-name">${escapeHtml(t.name)}</span>
+      <span class="dep-purpose">${escapeHtml(t.purpose)}</span>
+      <span class="dep-state ${t.path ? 'ok' : 'missing'}">${t.path ? '설치됨' : '없음'}</span>
+    </div>`
+  ).join('');
+  $('#installDepsBtn').style.display = tools.some((t) => !t.path) ? '' : 'none';
+}
+
+if (window.lmsApp) {
+  $('#depsCard').style.display = 'block';
+  loadDeps();
+  window.lmsApp.onDepsProgress(({ name, index, total }) => {
+    $('#installDepsBtn').textContent = `설치 중: ${name} (${index + 1}/${total})`;
+  });
+  $('#installDepsBtn').addEventListener('click', async () => {
+    const btn = $('#installDepsBtn');
+    btn.disabled = true;
+    try {
+      const result = await window.lmsApp.installDeps();
+      showToast(result.message, result.ok ? 'success' : 'error');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '&#11015; 없는 도구 설치';
+      loadDeps();
     }
   });
 }
@@ -353,6 +388,7 @@ function updateSelectedSummary() {
   }
 
   startBtn.disabled = false;
+  renderFilePreview();
   el.innerHTML = state.selectedCourses.map((c) =>
     `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border-light);font-size:14px;">
       <div style="flex:1;min-width:0;">
@@ -387,6 +423,16 @@ async function startDownload() {
   } catch {
     showToast('쿠키 상태 확인 실패', 'error');
     return;
+  }
+
+  // The app asks before installing any missing tool; stop if the user declines
+  if (window.lmsApp) {
+    const result = await window.lmsApp.ensureDeps();
+    loadDeps();
+    if (!result.ok) {
+      showToast(result.message, 'error');
+      return;
+    }
   }
 
   state.isDownloading = true;
@@ -593,6 +639,79 @@ $('#optCompress').addEventListener('change', () => {
 
 $('#compressSize').addEventListener('input', () => {
   $('#compressSizeLabel').textContent = `${$('#compressSize').value}MB`;
+  renderFilePreview();
+});
+
+// ── File preview ────────────────────────────────────────────
+// Mirrors the folder layout lms_download.sh writes, so users can see what each option produces
+function renderFilePreview() {
+  const video = $('#optVideo').checked;
+  const file = $('#optFile').checked;
+  const attach = $('#optAttach').checked;
+  const transcribe = $('#optTranscribe').checked;
+  const srt = transcribe && $('#optSrt').checked;
+  const compress = video && $('#optCompress').checked;
+
+  // Subtitles come from speech recognition, and compression needs a saved video
+  $('#optSrt').disabled = !transcribe;
+  $('#optSrt').closest('.option-item').classList.toggle('disabled', !transcribe);
+  $('#optCompress').disabled = !video;
+  $('#optCompress').closest('.option-item').classList.toggle('disabled', !video);
+
+  const lecture = '1강 운영체제 개요';
+  const weekFiles = [];
+  if (video) {
+    weekFiles.push(['&#127909;', `${lecture}.mp4`, compress ? `강의 영상 (${$('#compressSize').value}MB 이하로 압축)` : '강의 영상']);
+  }
+  if (transcribe) weekFiles.push(['&#128221;', `${lecture}.txt`, '음성 인식 텍스트']);
+  if (srt) weekFiles.push(['&#128172;', `${lecture}.srt`, '시간이 붙은 자막 (영상 플레이어에서 사용)']);
+  if (file) {
+    weekFiles.push(['&#128196;', '강의자료.pdf', 'PPT, HWP 등 올라온 원본 그대로']);
+    weekFiles.push(['&#128279;', '참고 링크.webloc', '외부 링크 (더블클릭하면 열림)']);
+  }
+
+  const kinds = [];
+  if (video) kinds.push('mp4 영상');
+  if (transcribe) kinds.push('txt 텍스트');
+  if (srt) kinds.push('srt 자막');
+  if (file) kinds.push('강의자료 원본', 'webloc 링크');
+  if (attach) kinds.push('공지·과제 첨부');
+  $('#fileKinds').innerHTML = kinds.map((k) => `<span class="file-kind">${k}</span>`).join('');
+
+  const courseName = state.selectedCourses[0]?.courseName || '강의 이름';
+  const rows = [[0, '&#128193;', `${$('#outputDir').value || '출력 폴더'}/`, '']];
+  rows.push([1, '&#128193;', `${courseName}/`, '']);
+  if (weekFiles.length) {
+    rows.push([2, '&#128193;', '1주차/', '주차마다 폴더가 생깁니다']);
+    weekFiles.forEach(([icon, name, desc]) => rows.push([3, icon, name, desc]));
+  }
+  if (attach) {
+    rows.push([2, '&#128193;', '공지/공지 제목/', '']);
+    rows.push([3, '&#128206;', '첨부파일.hwp', '공지에 올라온 첨부']);
+    rows.push([2, '&#128193;', '과제/과제 제목/', '']);
+    rows.push([3, '&#128206;', '첨부파일.pdf', '과제에 올라온 첨부']);
+  }
+
+  if (rows.length === 2) {
+    $('#fileTree').innerHTML = '<div class="tree-empty">선택한 옵션으로는 저장되는 파일이 없습니다. 위에서 하나 이상 체크해 주세요.</div>';
+  } else {
+    $('#fileTree').innerHTML = rows.map(([depth, icon, name, desc]) =>
+      `<div class="tree-row" style="padding-left:${depth * 20}px">
+        <span>${icon}</span><span class="tree-name">${escapeHtml(name)}</span>
+        ${desc ? `<span class="tree-desc">${desc}</span>` : ''}
+      </div>`
+    ).join('');
+  }
+
+  const notes = [];
+  if (!video && transcribe) notes.push(`영상은 음성 인식에만 쓰고 저장하지 않습니다. ${srt ? '텍스트와 자막만' : '텍스트만'} 남습니다.`);
+  if (transcribe && !srt) notes.push('자막 파일(.srt)도 필요하면 "자막(srt) 저장"을 체크하세요.');
+  if (transcribe) notes.push('이미 만들어진 텍스트와 자막은 다시 만들지 않습니다.');
+  $('#fileNotes').innerHTML = notes.map((n) => `<p>&#8226; ${n}</p>`).join('');
+}
+
+['#optVideo', '#optFile', '#optAttach', '#optTranscribe', '#optSrt', '#optCompress'].forEach((id) => {
+  $(id).addEventListener('change', renderFilePreview);
 });
 
 $('#cpuThreads').addEventListener('input', () => {
@@ -605,3 +724,4 @@ loadConfig();
 loadTerms();
 checkCookieStatus();
 updateSelectedSummary();
+renderFilePreview();

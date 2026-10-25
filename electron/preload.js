@@ -4,4 +4,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('lmsApp', {
   login: () => ipcRenderer.invoke('canvas-login'),
   pickFolder: (defaultPath) => ipcRenderer.invoke('pick-folder', defaultPath),
+  depsStatus: () => ipcRenderer.invoke('deps-status'),
+  installDeps: () => ipcRenderer.invoke('deps-install'),
+  ensureDeps: () => ipcRenderer.invoke('deps-ensure'),
+  onDepsProgress: (callback) => ipcRenderer.on('deps-progress', (_event, info) => callback(info)),
 });

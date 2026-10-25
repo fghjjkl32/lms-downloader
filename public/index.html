@@ -21,6 +21,13 @@
 
     <!-- ── Settings Tab ──────────────────────────────────── -->
     <div class="tab-content active" id="tab-settings">
+      <div class="card" id="depsCard" style="display:none">
+        <div class="card-title"><span class="icon">&#128295;</span> 필수 도구</div>
+        <p class="hint" style="margin-bottom:12px">다운로드와 음성 인식에 쓰는 도구입니다. 없는 도구는 버튼 한 번으로 이 앱 안에 설치합니다.</p>
+        <div id="depsList"></div>
+        <button class="btn btn-primary" id="installDepsBtn" type="button" style="display:none;margin-top:12px">&#11015; 없는 도구 설치</button>
+      </div>
+
       <div class="card">
         <div class="card-title"><span class="icon">&#127908;</span> 음성 인식</div>
         <div class="form-group">
@@ -56,7 +63,7 @@
 
       <div class="card" id="loginCard" style="display:none">
         <div class="card-title"><span class="icon">&#128100;</span> Canvas 로그인</div>
-        <p class="hint" style="margin-bottom:12px">로그인 창에서 숭실대 계정으로 로그인하면 쿠키와 토큰을 자동으로 저장합니다. 창이 자동으로 닫히지 않으면 아무 강의나 열어 보세요.</p>
+        <p class="hint" style="margin-bottom:12px">로그인 창에서 숭실대 계정으로 로그인하면 강의 페이지로 자동 이동한 뒤 쿠키와 토큰을 저장하고 창을 닫습니다. 창이 닫히지 않으면 아무 강의의 강의콘텐츠 메뉴를 열어 보세요.</p>
         <button class="btn btn-primary" id="canvasLoginBtn" type="button">&#128273; Canvas 로그인</button>
       </div>
 
@@ -188,6 +195,13 @@
           </div>
         </div>
 
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span class="icon">&#128450;</span> 저장될 파일 미리보기 <span class="hint">(위 옵션에 따라 바뀝니다)</span></div>
+        <div class="file-kinds" id="fileKinds"></div>
+        <div class="file-tree" id="fileTree"></div>
+        <div class="file-notes" id="fileNotes"></div>
       </div>
 
       <div class="card" id="selectedSummary">

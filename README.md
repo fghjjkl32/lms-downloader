@@ -20,8 +20,11 @@
 
 ### 필수
 
+데스크톱 앱(DMG)은 처음 실행할 때 없는 도구(jq, ffmpeg, ffprobe, uv)를 설치할지 묻고, 앱 데이터 폴더에 직접 설치합니다.
+Homebrew나 터미널은 필요 없습니다. 소스에서 직접 실행할 때만 아래 명령이 필요합니다.
+
 ```bash
-brew install ffmpeg jq curl node
+brew install ffmpeg jq node uv
 ```
 
 ### 선택
