@@ -1,152 +1,147 @@
 # LMS 다운로더
 
-숭실대 Canvas LMS 강의 영상/자료를 자동 다운로드하고, OpenAI Whisper로 음성을 텍스트로 변환하는 웹 GUI 도구입니다.
+숭실대 Canvas LMS의 강의 영상, 강의 자료, 공지·과제 첨부파일을 한 번에 내려받는 Mac 앱입니다.
+영상의 음성을 텍스트와 자막(.srt)으로 바꿀 수 있고, 기본값은 내 Mac에서 무료로 처리하는 방식입니다.
+
+버전별 수정 내역은 [CHANGELOG.md](CHANGELOG.md)에 있습니다.
 
 ## 기능
 
-- 강의 영상 다운로드 (everlec, mp4 등)
-- 강의자료 다운로드 (PDF, PPT, 문서 등)
-- 공지·과제 첨부파일 다운로드
-- 외부 링크 항목을 `.webloc` 링크 파일로 저장
-- 학기 선택 (지난 학기, 계절학기, 비정규과정 포함)
-- 앱 안에서 Canvas 로그인 (쿠키 자동 저장)
-- 자동 음성 인식 (영상 → 텍스트, 선택하면 .srt 자막도 저장)
+- 강의 영상 다운로드 (everlec, mp4 등). 받다가 끊긴 영상은 다음 실행에서 이어받기
+- 강의 자료를 원본 파일로 다운로드 (PDF, PPT, HWP 등)
+- 공지·과제 첨부파일 다운로드, 본문의 외부 링크(Google Drive, Notion 등)는 `.webloc` 바로가기로 저장
+- 외부 링크 강의 항목을 `.webloc`로 저장
+- 학기 선택 (지난 학기, 계절학기, 비정규과정 포함), 강의별 주차 선택
+- 앱 안에서 Canvas 로그인 (쿠키와 토큰 자동 저장)
+- 음성 인식 (영상 → 텍스트, 선택하면 .srt 자막도 저장)
   - 기본: 내 Mac에서 무료로 처리 (mlx-whisper, Apple Silicon)
-  - 선택: OpenAI API 키 또는 OpenAI 호환 서버(VoiceStudio 등)
-- PDF/문서 → 마크다운 변환 (markitdown 설치 시)
-- 실시간 진행상황 표시
+  - 선택: OpenAI API 키, 또는 OpenAI 호환 서버(VoiceStudio 등)
+  - 영상을 저장하지 않고 텍스트만 남기기
+- 영상 압축 (목표 크기 이하)
+- 필요한 도구(jq, ffmpeg, ffprobe, uv)를 앱 안에서 설치
+- 옵션에 따라 저장될 파일과 폴더 구조 미리보기
+- 실패한 항목을 원인과 함께 표시하고 Mac 알림으로 알림, 실행 로그 저장
 
-## 사전 준비
+## 설치 (일반 사용자)
 
-### 필수
+**Apple Silicon Mac(M1 이상)** 에서만 동작합니다.
 
-데스크톱 앱(DMG)은 처음 실행할 때 없는 도구(jq, ffmpeg, ffprobe, uv)를 설치할지 묻고, 앱 데이터 폴더에 직접 설치합니다.
-Homebrew나 터미널은 필요 없습니다. 소스에서 직접 실행할 때만 아래 명령이 필요합니다.
+1. [Releases](https://github.com/fghjjkl32/lms-downloader/releases/latest)에서 `LMS.Downloader-<버전>-arm64.dmg`를 받습니다.
+2. DMG를 열고 `LMS Downloader`를 **응용 프로그램** 폴더로 끌어다 놓습니다.
+3. 처음 열 때 "확인되지 않은 개발자" 경고가 나오면 **시스템 설정 → 개인정보 보호 및 보안**에서 **그래도 열기**를 누릅니다.
+   버튼이 보이지 않으면 터미널에서 아래 명령을 실행한 뒤 엽니다.
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/LMS Downloader.app"
+   ```
+4. 처음 실행하면 필요한 도구를 설치할지 묻습니다. **설치**를 누르면 공식 배포 파일(약 53MB)을 체크섬으로 확인한 뒤 앱 데이터 폴더에 설치합니다. Homebrew나 관리자 암호는 필요 없습니다.
 
-```bash
-brew install ffmpeg jq node uv
-```
-
-### 선택
-
-```bash
-brew install fzf                    # 터미널 인터랙티브 모드용
-pip install 'markitdown[all]'       # PDF→마크다운 변환
-```
-
-### 음성 인식 방식
-
-기본값은 **무료 방식**입니다. Apple Silicon Mac에서 mlx-whisper로 처리하므로 API 키가 필요 없습니다.
-처음 사용할 때 엔진을 자동으로 설치하고(1~2분, `uv` 또는 Python 3.10 이상 필요) 모델 1.6GB를 내려받습니다.
-1시간 강의는 3~4분 정도 걸립니다.
-
-설정의 **처리 방식**에서 OpenAI API 키나 직접 지정한 서버로 바꿀 수 있습니다.
-
-### OpenAI API 키 (OpenAI 방식을 고른 경우)
-
-1. https://platform.openai.com/api-keys 접속
-2. "Create new secret key" 클릭
-3. 발급된 `sk-...` 키를 웹 GUI 설정에 입력
-
-> Whisper API 요금: 분당 $0.006 (1시간 강의 ≈ 500원)
-
-## 설치 및 실행
-
-### 데스크톱 앱 (권장)
-
-```bash
-git clone <repository-url>
-cd lms-downloader
-npm install
-npm run dist
-```
-
-`dist/mac-arm64/LMS Downloader.app`을 `/Applications`로 옮긴 뒤 더블클릭해서 실행합니다.
-설정과 쿠키는 `~/Library/Application Support/LMS Downloader/`에 저장됩니다.
-개발 중에는 `npm run app`으로 빌드 없이 실행할 수 있습니다.
-
-### 웹 버전
-
-```bash
-npm install
-npm start
-```
-
-브라우저에서 http://localhost:8080 접속. 웹 버전에는 로그인 버튼이 없으므로 쿠키 파일을 직접 업로드합니다.
+자세한 설치 및 사용 방법은 각 Release 페이지 본문(`INSTALL.md`)에 있습니다.
 
 ## 사용 방법
 
-### 1단계: Canvas 로그인
+앱 위쪽의 **설정**, **강의 선택**, **다운로드** 탭을 차례대로 진행합니다.
 
-데스크톱 앱에서는 **설정** 탭의 **Canvas 로그인** 버튼을 누르고 숭실대 계정으로 로그인합니다.
-로그인이 끝나면 창이 저절로 닫히고 쿠키와 토큰이 저장됩니다.
+### 1. 설정
 
-웹 버전을 쓰거나 로그인 창이 동작하지 않을 때는 쿠키 파일을 직접 업로드합니다.
+- **필수 도구**: 도구마다 설치 상태가 나오고, 없는 도구는 **없는 도구 설치**로 설치합니다.
+- **Canvas 로그인**: 숭실대 계정으로 로그인하면 앱이 강의콘텐츠 페이지로 자동 이동해 토큰을 받고 창을 닫습니다.
+- **출력 디렉토리**: **폴더 선택** 버튼으로 저장할 폴더를 고릅니다.
+- **음성 인식 → 처리 방식**
+  - **무료: 내 Mac에서 처리** (기본값): 처음 한 번 엔진 설치(1~2분)와 모델 다운로드(약 1.6GB)가 필요합니다. 1시간 강의는 3~4분 정도 걸립니다.
+  - **OpenAI API 키 사용**: 분당 $0.006 (1시간 강의 약 500원). [API 키 발급](https://platform.openai.com/api-keys)
+  - **직접 지정한 서버**: OpenAI 호환 `/v1/audio/transcriptions` 서버 주소를 입력합니다.
 
-1. Chrome 확장 [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) 설치
-2. https://canvas.ssu.ac.kr 에 로그인
-3. 확장 아이콘 클릭 → **Export** 클릭 → 파일 저장
-4. 웹 GUI **설정** 탭 → **쿠키 파일 업로드** 버튼 클릭 → 저장한 파일 선택
+로그인을 쓰지 않을 때는 Chrome 확장 [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)로 내보낸 쿠키 파일을 **쿠키 파일 업로드**로 올려도 됩니다.
 
-> 쿠키 업로드 시 Canvas 인증 토큰이 자동으로 추출됩니다.
-> 별도로 Canvas 토큰을 입력할 필요가 없습니다.
+### 2. 강의 선택
 
-### 2단계: 강의 선택
+학기를 고르고 내려받을 강의를 체크합니다.
 
-1. **강의 선택** 탭 클릭
-2. 학기를 고르고 **강의 불러오기** 버튼 클릭
-3. 다운로드할 강의를 체크박스로 선택 (전체 선택 가능)
+### 3. 다운로드
 
-### 3단계: 다운로드
+옵션을 체크하면 **저장될 파일 미리보기**에 결과가 바로 나옵니다.
 
-1. **다운로드** 탭 클릭
-2. 옵션 설정:
-   - 영상 다운로드 (체크/해제)
-   - 자료 다운로드 (체크/해제)
-   - 공지·과제 첨부 (체크/해제)
-   - 음성 인식 (체크/해제, OpenAI 키 필요)
-   - 공개 항목만 / 전체
-   - 주차 필터 (예: `1,2,3`)
-3. **다운로드 시작** 클릭
+| 옵션 | 저장되는 파일 |
+|---|---|
+| 영상 다운로드 | `강의제목.mp4` |
+| 자료 다운로드 | 강의 자료 원본, 외부 링크 `.webloc` |
+| 공지·과제 첨부 | `공지/공지제목/`, `과제/과제제목/` 아래 첨부파일과 링크 |
+| 음성 인식 | `강의제목.txt` (영상 다운로드를 끄면 영상은 지우고 텍스트만 남김) |
+| 자막(srt) 저장 | `강의제목.srt` (음성 인식을 켰을 때만) |
+| 영상 압축 | 영상을 목표 크기 이하로 압축 (영상 다운로드를 켰을 때만) |
+| 공개 항목만 | 아직 공개되지 않은 항목은 건너뜀 |
 
-다운로드된 파일은 설정의 **출력 디렉토리**에 저장됩니다. 앱에서는 **폴더 선택** 버튼으로 Finder에서 고릅니다.
+강의마다 주차를 입력하면(예: `1,2,3`) 그 주차만 받습니다. 비워 두면 전체를 받습니다.
 
 ```
-output/
+출력 폴더/
   └── 강의명/
-      └── 1주차/
-          ├── 영상제목.mp4
-          ├── 영상제목.txt    ← 음성 인식 결과
-          ├── 영상제목.srt    ← 자막 (자막 저장을 켠 경우)
-          ├── 자료제목.pdf
-          ├── 자료제목.md     ← 마크다운 변환
-          └── 링크제목.webloc ← 외부 링크 (더블클릭하면 브라우저로 열림)
+      ├── 1주차/
+      │   ├── 영상제목.mp4
+      │   ├── 영상제목.txt     ← 음성 인식 결과
+      │   ├── 영상제목.srt     ← 자막 (자막 저장을 켠 경우)
+      │   ├── 자료제목.pdf
+      │   └── 링크제목.webloc  ← 외부 링크 (더블클릭하면 브라우저로 열림)
       ├── 공지/
       │   └── 공지제목/첨부파일.pdf, 외부링크.webloc
       └── 과제/
           └── 과제제목/첨부파일.hwpx
 ```
 
-## 실패 원인과 로그
+이미 받은 파일과 이미 만든 텍스트·자막은 다시 받거나 만들지 않습니다.
 
-- 실패한 항목은 진행 화면의 **문제가 생긴 항목** 카드에 원인과 함께 나오고, Mac 알림으로도 알려 줍니다.
-- 스크립트는 실패마다 `[FAIL] 종류: 항목 :: 원인` 줄을 출력하고, 서버가 이 줄을 모아 화면에 보냅니다.
-- 실행 로그는 `~/Library/Application Support/LMS Downloader/logs/`에 실행마다 하나씩 저장됩니다 (최근 30개).
-- 받다가 끊긴 영상은 `.part`로 남겨 두었다가 다음 실행에서 이어받습니다.
+## 실패했을 때
 
-## 참고
+- 실패한 항목은 진행 화면의 **문제가 생긴 항목** 카드에 원인과 해결 방법이 함께 나옵니다. Mac 알림으로도 알려 줍니다.
+  - 예: 로그인 만료, 인터넷 연결 없음, 시간 초과, 파일 삭제(404), 저장 폴더에 쓸 수 없음, 저장 공간 부족, 음성 인식 메모리 부족, OpenAI 키 오류
+- 받을 수 없는 첨부는 이유를 보여 줍니다 (다른 강의의 파일, 비공개, 삭제).
+- 다시 다운로드하면 받지 못한 항목만 다시 받습니다. 끊긴 영상은 이어받습니다.
+- 실행 로그는 `~/Library/Application Support/LMS Downloader/logs/`에 실행마다 하나씩 저장됩니다 (최근 30개). **전체 로그 폴더 열기** 버튼으로 열 수 있습니다.
 
-- 이미 다운로드된 파일은 자동으로 건너뜁니다 (중복 방지)
-- 이전 버전에서 자료 파일 대신 뷰어 웹페이지(HTML)가 저장된 경우, 다음 실행 때 자동으로 다시 받습니다
-- 24MB 초과 영상은 자동 분할 후 음성 인식 처리
-- 쿠키는 일정 시간이 지나면 만료됩니다. 오류 발생 시 쿠키를 다시 추출해서 업로드하세요.
-- 개인 설정 파일(`config.json`, `cookies.txt`)은 `.gitignore`에 포함되어 Git에 업로드되지 않습니다.
+### 자주 생기는 문제
 
-## 터미널에서 직접 사용 (GUI 없이)
+- **"포트 8080을 사용할 수 없습니다"**: 이미 실행 중인 LMS 다운로더(`npm start` 포함)를 종료한 뒤 다시 엽니다.
+- **강의 목록이 나오지 않음**: 로그인이 만료되었을 수 있습니다. **Canvas 로그인**을 다시 누릅니다. 토큰은 로그인 후 약 2시간 동안 유효합니다.
+- **로그인 창이 닫히지 않음**: 아무 강의의 **강의콘텐츠** 메뉴를 열어 봅니다.
+
+## 개발
+
+### 소스에서 실행
+
+```bash
+brew install node jq ffmpeg uv
+git clone https://github.com/fghjjkl32/lms-downloader.git
+cd lms-downloader
+npm install
+npm run app        # Electron 앱으로 실행
+npm start          # 웹 버전 (http://localhost:8080, 로그인 버튼 없음)
+```
+
+### 빌드
+
+```bash
+npm run dist       # dist/mac-arm64/LMS Downloader.app
+npm run dist:dmg   # dist/LMS Downloader-<버전>-arm64.dmg
+```
+
+설정, 쿠키, 설치한 도구, 로그는 `~/Library/Application Support/LMS Downloader/`에 저장됩니다.
+개인 설정 파일(`config.json`, `cookies.txt`)은 `.gitignore`에 포함되어 있습니다.
+
+### 구조
+
+| 파일 | 역할 |
+|---|---|
+| `electron/main.js` | 앱 창, Canvas 로그인 창, 폴더 선택, 도구 설치 안내 |
+| `electron/deps.js` | jq, ffmpeg, ffprobe, uv를 공식 릴리스에서 받아 체크섬 확인 후 설치 |
+| `server.js` | 127.0.0.1:8080 Express 서버. 설정 저장, 강의 목록, 다운로드 실행과 SSE 진행 상황, 실행 로그 |
+| `lms_download.sh` | 실제 다운로드와 음성 인식. 실패마다 `[FAIL] 종류: 항목 :: 원인` 줄을 출력 |
+| `public/` | 화면 (설정, 강의 선택, 다운로드 탭) |
+
+### 터미널에서 직접 사용
 
 ```bash
 # 인터랙티브 모드
-OPENAI_API_KEY="sk-..." COOKIES_FILE="./cookies.txt" bash lms_download.sh -i
+COOKIES_FILE="./cookies.txt" bash lms_download.sh -i
 
 # 특정 강의 다운로드
 CANVAS_TOKEN="..." COOKIES_FILE="./cookies.txt" bash lms_download.sh -c 44114
@@ -159,6 +154,10 @@ bash lms_download.sh -c 44114 --no-video
 
 # 음성 인식 결과만 (영상은 저장하지 않음)
 bash lms_download.sh -c 44114 --no-keep-video --no-file --no-attach
+
+# 자막까지 저장, OpenAI 방식
+TRANSCRIBE_ENGINE=openai OPENAI_API_KEY="sk-..." bash lms_download.sh -c 44114 --srt
 ```
 
-자세한 옵션은 `bash lms_download.sh --help` 참조
+자세한 옵션은 `bash lms_download.sh --help`를 참고하세요.
+선택 도구: `brew install fzf` (인터랙티브 모드), `pip install 'markitdown[all]'` (자료를 마크다운으로도 변환).
